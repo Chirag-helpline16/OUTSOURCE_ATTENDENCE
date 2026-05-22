@@ -117,6 +117,13 @@ def _clean_joined_date(value: Any) -> str:
 
 
 def _clean_ip_address(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
     return " ".join(str(value or "").strip().split())
 
 
@@ -1756,13 +1763,12 @@ def _logout_authenticated_role(role: str) -> None:
 
 
 def _render_auth_status(auth: dict[str, Any], role: str) -> None:
-    status_col, logout_col = st.columns([0.78, 0.22])
-    with status_col:
+    with st.sidebar:
+        st.divider()
         st.caption(
             f"Logged in as {auth.get('name', role.title())} "
             f"({role.replace('_', ' ').title()})"
         )
-    with logout_col:
         if st.button("Logout", use_container_width=True, key=f"{role}_logout"):
             _logout_authenticated_role(role)
 
@@ -1875,30 +1881,34 @@ def _render_decision_form(
             disabled=True,
             key=f"{key_prefix}_selected_user",
         )
-    decision_label = st.radio(
-        "Decision",
-        options=["Accepted", "Rejected"],
-        horizontal=True,
-        key=f"{key_prefix}_decision",
-    )
     remarks = st.text_area(
         "Remarks",
         placeholder="Optional. Add reason when rejecting or context for audit.",
         key=f"{key_prefix}_remarks",
     )
-    if st.button("Save Decision", type="primary", use_container_width=True, key=f"{key_prefix}_save"):
+
+    def save_decision(decision: str) -> None:
         try:
             service.decide_entry(
                 entry_id=selected_entry_id,
-                decision=decision_label.lower(),
+                decision=decision,
                 actor_role=actor_role,
                 actor_name=actor_name,
                 remarks=remarks,
             )
-            st.success("Decision saved.")
+            st.success(f"Entry {decision}.")
             st.rerun()
         except ValueError as exc:
             st.error(str(exc))
+
+    st.caption("Decision")
+    accept_col, reject_col = st.columns(2)
+    with accept_col:
+        if st.button("Accept", use_container_width=True, key=f"{key_prefix}_accept"):
+            save_decision("accepted")
+    with reject_col:
+        if st.button("Reject", use_container_width=True, key=f"{key_prefix}_reject"):
+            save_decision("rejected")
 
 
 def render_attendance_admin_page() -> None:

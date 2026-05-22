@@ -153,6 +153,55 @@ def apply_professional_theme() -> None:
             color: #ffffff;
         }
 
+        .st-key-admin_decision_accept button,
+        .st-key-observer_decision_accept button {
+            background: var(--att-green) !important;
+            border-color: var(--att-green) !important;
+            color: #ffffff !important;
+            box-shadow: 0 8px 18px rgba(22, 163, 74, 0.22) !important;
+        }
+
+        .st-key-admin_decision_accept button:hover,
+        .st-key-observer_decision_accept button:hover {
+            background: #15803d !important;
+            border-color: #15803d !important;
+            color: #ffffff !important;
+        }
+
+        .st-key-admin_decision_reject button,
+        .st-key-observer_decision_reject button {
+            background: var(--att-rose) !important;
+            border-color: var(--att-rose) !important;
+            color: #ffffff !important;
+            box-shadow: 0 8px 18px rgba(225, 29, 72, 0.22) !important;
+        }
+
+        .st-key-admin_decision_reject button:hover,
+        .st-key-observer_decision_reject button:hover {
+            background: #be123c !important;
+            border-color: #be123c !important;
+            color: #ffffff !important;
+        }
+
+        .st-key-admin_logout button,
+        .st-key-observer_logout button,
+        .st-key-outsource_logout button {
+            min-height: 2.5rem;
+            padding: 0.55rem 0.8rem;
+            background: #ffffff !important;
+            border-color: #cbd5e1 !important;
+            color: var(--att-ink) !important;
+            box-shadow: none !important;
+        }
+
+        .st-key-admin_logout button:hover,
+        .st-key-observer_logout button:hover,
+        .st-key-outsource_logout button:hover {
+            background: #fee2e2 !important;
+            border-color: #fecaca !important;
+            color: #991b1b !important;
+        }
+
         .stAlert {
             border-radius: 8px;
         }

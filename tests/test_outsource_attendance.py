@@ -167,6 +167,21 @@ def test_login_ip_address_is_stored_and_exported(tmp_path):
     assert raw.iloc[0]["IP Address"] == "203.0.113.10"
 
 
+def test_missing_ip_address_displays_as_not_captured(tmp_path):
+    service = AttendanceService(tmp_path / "attendance.sqlite")
+    outsource_id = service.add_user("No IP User", "outsource", "9876543222")
+
+    service.submit_login(
+        outsource_id,
+        "pc-no-ip",
+        login_at=datetime(2026, 5, 8, 10, 30, tzinfo=IST),
+    )
+
+    raw = service.build_raw_attendance_df("2026-05")
+
+    assert raw.iloc[0]["IP Address"] == "Not captured"
+
+
 def test_export_workbook_contains_attendance_sheets(tmp_path):
     service = AttendanceService(tmp_path / "attendance.sqlite")
     outsource_id = service.add_user("Neha Vendor", "outsource", "9876543213")
