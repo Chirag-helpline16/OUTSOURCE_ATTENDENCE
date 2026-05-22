@@ -77,8 +77,8 @@ def apply_professional_theme() -> None:
         }
 
         h1 {
-            padding-left: 0.85rem;
-            border-left: 5px solid var(--att-red);
+            padding-left: 0;
+            border-left: 0;
             font-family: var(--att-display) !important;
             font-weight: 400;
             letter-spacing: 0;
@@ -93,6 +93,10 @@ def apply_professional_theme() -> None:
             margin-top: 0.65rem;
             border-radius: 999px;
             background: linear-gradient(90deg, var(--att-red), var(--att-amber), var(--att-blue), var(--att-green));
+        }
+
+        [data-testid="stSidebar"] h1::after {
+            display: none;
         }
 
         h2, h3 {
