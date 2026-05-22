@@ -23,6 +23,7 @@ def apply_professional_theme() -> None:
         """
         <style>
         @import url('https://fonts.googleapis.com/css2?family=Michroma&family=Space+Mono:wght@400;700&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,400,0,0&display=block');
 
         :root {
             color-scheme: light;
@@ -53,6 +54,39 @@ def apply_professional_theme() -> None:
         body * {
             font-family: var(--att-font) !important;
             letter-spacing: 0 !important;
+        }
+
+        .material-icons,
+        .material-icons-outlined,
+        .material-symbols-rounded,
+        .material-symbols-outlined,
+        [data-testid="stIconMaterial"],
+        span[class*="material-icons"],
+        span[class*="material-symbols"],
+        button[data-testid="stBaseButton-headerNoPadding"] span {
+            font-family: 'Material Symbols Rounded', 'Material Icons', 'Material Icons Outlined' !important;
+            font-weight: normal !important;
+            font-style: normal !important;
+            font-size: 20px !important;
+            line-height: 1 !important;
+            letter-spacing: normal !important;
+            text-transform: none !important;
+            white-space: nowrap !important;
+            word-wrap: normal !important;
+            direction: ltr !important;
+            -webkit-font-feature-settings: 'liga' !important;
+            -webkit-font-smoothing: antialiased !important;
+            font-feature-settings: 'liga' !important;
+        }
+
+        button[data-testid="stBaseButton-headerNoPadding"] {
+            width: 32px !important;
+            height: 32px !important;
+            min-height: 32px !important;
+            padding: 4px !important;
+            overflow: hidden !important;
+            border-radius: 8px !important;
+            color: var(--att-ink) !important;
         }
 
         .block-container {
