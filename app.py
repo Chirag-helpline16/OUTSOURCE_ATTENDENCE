@@ -121,6 +121,55 @@ def apply_professional_theme() -> None:
             margin-bottom: 0.35rem;
         }
 
+        [data-testid="stSidebar"] .st-key-main_navigation div[role="radiogroup"] {
+            display: grid;
+            gap: 0.65rem;
+            width: 100%;
+        }
+
+        [data-testid="stSidebar"] .st-key-main_navigation div[role="radiogroup"] label {
+            width: 100%;
+            min-height: 48px;
+            box-sizing: border-box;
+            display: flex;
+            align-items: center;
+            gap: 0.55rem;
+            padding: 0.75rem 0.9rem;
+            margin: 0;
+            border: 1px solid #cbd5e1;
+            border-left: 5px solid #93c5fd;
+            border-radius: 8px;
+            background: #ffffff;
+            box-shadow: 0 6px 14px rgba(15, 23, 42, 0.05);
+            transition:
+                transform 160ms ease,
+                box-shadow 160ms ease,
+                border-color 160ms ease,
+                background 160ms ease;
+        }
+
+        [data-testid="stSidebar"] .st-key-main_navigation div[role="radiogroup"] label:hover {
+            transform: translateX(4px);
+            border-color: var(--att-primary);
+            border-left-color: var(--att-primary);
+            background: #eff6ff;
+            box-shadow: 0 10px 20px rgba(37, 99, 235, 0.12);
+        }
+
+        [data-testid="stSidebar"] .st-key-main_navigation div[role="radiogroup"] label:has(input:checked) {
+            border-color: var(--att-primary);
+            border-left-color: var(--att-primary);
+            background: linear-gradient(90deg, #dbeafe 0%, #ffffff 100%);
+            box-shadow: 0 12px 24px rgba(37, 99, 235, 0.16);
+            transform: translateX(2px);
+        }
+
+        [data-testid="stSidebar"] .st-key-main_navigation div[role="radiogroup"] label p {
+            font-weight: 700;
+            color: var(--att-ink);
+            white-space: nowrap;
+        }
+
         div[data-baseweb="input"] > div,
         div[data-baseweb="select"] > div,
         textarea {
@@ -230,6 +279,7 @@ def main() -> None:
             "Open page",
             options=list(PAGES.keys()),
             label_visibility="collapsed",
+            key="main_navigation",
         )
         st.divider()
         st.caption("Outsource attendance system")
