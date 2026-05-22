@@ -22,23 +22,37 @@ def apply_professional_theme() -> None:
     st.markdown(
         """
         <style>
+        @import url('https://fonts.googleapis.com/css2?family=Michroma&family=Space+Mono:wght@400;700&display=swap');
+
         :root {
             color-scheme: light;
-            --att-primary: #2563eb;
-            --att-primary-dark: #1d4ed8;
-            --att-teal: #0f766e;
-            --att-green: #16a34a;
-            --att-amber: #d97706;
-            --att-rose: #e11d48;
-            --att-ink: #0f172a;
-            --att-muted: #64748b;
-            --att-line: #dbe3ef;
-            --att-soft: #f6f8fb;
+            --att-red: #F04348;
+            --att-amber: #FF9F0A;
+            --att-blue: #2F80FF;
+            --att-green: #21C16B;
+            --att-ink: #090C12;
+            --att-muted: #617086;
+            --att-faint: #91A0B8;
+            --att-line: #D9E1EC;
+            --att-line-strong: #B9C6D8;
+            --att-soft: #F6F8FB;
+            --att-panel: #FFFFFF;
+            --att-font: 'Space Mono', ui-monospace, SFMono-Regular, Consolas, monospace;
+            --att-display: 'Michroma', 'Space Mono', ui-monospace, monospace;
         }
 
         .stApp {
             background: #ffffff;
             color: var(--att-ink);
+        }
+
+        html, body, .stApp, [class*="css"] {
+            font-family: var(--att-font) !important;
+        }
+
+        body * {
+            font-family: var(--att-font) !important;
+            letter-spacing: 0 !important;
         }
 
         .block-container {
@@ -48,9 +62,9 @@ def apply_professional_theme() -> None:
 
         [data-testid="stSidebar"] {
             background:
-                linear-gradient(180deg, #eff6ff 0%, #ffffff 34%, #f8fafc 100%);
+                linear-gradient(180deg, #ffffff 0%, #F8FAFC 42%, #ffffff 100%);
             border-right: 1px solid var(--att-line);
-            box-shadow: 12px 0 34px rgba(15, 23, 42, 0.06);
+            box-shadow: 12px 0 34px rgba(9, 12, 18, 0.06);
         }
 
         [data-testid="stSidebar"] * {
@@ -64,12 +78,55 @@ def apply_professional_theme() -> None:
 
         h1 {
             padding-left: 0.85rem;
-            border-left: 5px solid var(--att-primary);
+            border-left: 5px solid var(--att-red);
+            font-family: var(--att-display) !important;
+            font-weight: 400;
             letter-spacing: 0;
+            position: relative;
+        }
+
+        h1::after {
+            content: "";
+            display: block;
+            width: min(320px, 100%);
+            height: 4px;
+            margin-top: 0.65rem;
+            border-radius: 999px;
+            background: linear-gradient(90deg, var(--att-red), var(--att-amber), var(--att-blue), var(--att-green));
         }
 
         h2, h3 {
             letter-spacing: 0;
+            font-weight: 700;
+        }
+
+        .attendance-accent-line {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 4px;
+            margin: 0.2rem 0 1rem;
+        }
+
+        .attendance-accent-line span {
+            height: 4px;
+            border-radius: 999px;
+            display: block;
+        }
+
+        .attendance-accent-line span:nth-child(1) {
+            background: var(--att-red);
+        }
+
+        .attendance-accent-line span:nth-child(2) {
+            background: var(--att-amber);
+        }
+
+        .attendance-accent-line span:nth-child(3) {
+            background: var(--att-blue);
+        }
+
+        .attendance-accent-line span:nth-child(4) {
+            background: var(--att-green);
         }
 
         div[data-testid="stCaptionContainer"] p,
@@ -83,24 +140,36 @@ def apply_professional_theme() -> None:
             background: #ffffff;
             border: 1px solid var(--att-line);
             border-radius: 8px;
-            box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
+            box-shadow: 0 10px 24px rgba(9, 12, 18, 0.06);
         }
 
         div[data-testid="stMetric"] {
-            border-top: 4px solid var(--att-primary);
+            border-top: 4px solid var(--att-red);
             padding: 0.85rem;
+        }
+
+        div[data-testid="stMetric"]:nth-of-type(2n) {
+            border-top-color: var(--att-amber);
+        }
+
+        div[data-testid="stMetric"]:nth-of-type(3n) {
+            border-top-color: var(--att-blue);
+        }
+
+        div[data-testid="stMetric"]:nth-of-type(4n) {
+            border-top-color: var(--att-green);
         }
 
         div[data-testid="stForm"] {
             padding: 1rem;
-            border-top: 4px solid var(--att-teal);
+            border-top: 4px solid var(--att-blue);
         }
 
         .stDataFrame {
             border: 1px solid var(--att-line);
             border-radius: 8px;
             overflow: hidden;
-            box-shadow: 0 8px 22px rgba(15, 23, 42, 0.04);
+            box-shadow: 0 8px 22px rgba(9, 12, 18, 0.04);
         }
 
         [data-testid="stTabs"] button {
@@ -109,8 +178,8 @@ def apply_professional_theme() -> None:
         }
 
         [data-testid="stTabs"] button[aria-selected="true"] {
-            color: var(--att-primary);
-            border-bottom-color: var(--att-primary);
+            color: var(--att-red);
+            border-bottom-color: var(--att-red);
         }
 
         div[role="radiogroup"] label {
@@ -136,11 +205,11 @@ def apply_professional_theme() -> None:
             gap: 0.55rem;
             padding: 0.75rem 0.9rem;
             margin: 0;
-            border: 1px solid #cbd5e1;
-            border-left: 5px solid #93c5fd;
+            border: 1px solid var(--att-line-strong);
+            border-left: 5px solid var(--att-red);
             border-radius: 8px;
             background: #ffffff;
-            box-shadow: 0 6px 14px rgba(15, 23, 42, 0.05);
+            box-shadow: 0 6px 14px rgba(9, 12, 18, 0.05);
             transition:
                 transform 160ms ease,
                 box-shadow 160ms ease,
@@ -148,19 +217,29 @@ def apply_professional_theme() -> None:
                 background 160ms ease;
         }
 
+        [data-testid="stSidebar"] .st-key-main_navigation div[role="radiogroup"] label:nth-of-type(2) {
+            border-left-color: var(--att-amber);
+        }
+
+        [data-testid="stSidebar"] .st-key-main_navigation div[role="radiogroup"] label:nth-of-type(3) {
+            border-left-color: var(--att-blue);
+        }
+
+        [data-testid="stSidebar"] .st-key-main_navigation div[role="radiogroup"] label:nth-of-type(4) {
+            border-left-color: var(--att-green);
+        }
+
         [data-testid="stSidebar"] .st-key-main_navigation div[role="radiogroup"] label:hover {
             transform: translateX(4px);
-            border-color: var(--att-primary);
-            border-left-color: var(--att-primary);
-            background: #eff6ff;
-            box-shadow: 0 10px 20px rgba(37, 99, 235, 0.12);
+            border-color: var(--att-blue);
+            background: linear-gradient(90deg, rgba(47, 128, 255, 0.10), #ffffff 72%);
+            box-shadow: 0 10px 20px rgba(47, 128, 255, 0.12);
         }
 
         [data-testid="stSidebar"] .st-key-main_navigation div[role="radiogroup"] label:has(input:checked) {
-            border-color: var(--att-primary);
-            border-left-color: var(--att-primary);
-            background: linear-gradient(90deg, #dbeafe 0%, #ffffff 100%);
-            box-shadow: 0 12px 24px rgba(37, 99, 235, 0.16);
+            border-color: var(--att-red);
+            background: linear-gradient(90deg, rgba(240, 67, 72, 0.12), #ffffff 72%);
+            box-shadow: 0 12px 24px rgba(240, 67, 72, 0.16);
             transform: translateX(2px);
         }
 
@@ -181,25 +260,25 @@ def apply_professional_theme() -> None:
         div[data-baseweb="input"] > div:focus-within,
         div[data-baseweb="select"] > div:focus-within,
         textarea:focus {
-            border-color: var(--att-primary);
-            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14);
+            border-color: var(--att-blue);
+            box-shadow: 0 0 0 3px rgba(47, 128, 255, 0.14);
         }
 
         .stButton > button,
         .stDownloadButton > button {
             border-radius: 8px;
-            border: 1px solid var(--att-primary);
-            background: var(--att-primary);
-            color: #ffffff;
+            border: 1px solid var(--att-red);
+            background: var(--att-red);
+            color: var(--att-ink);
             font-weight: 600;
-            box-shadow: 0 8px 18px rgba(37, 99, 235, 0.2);
+            box-shadow: 0 8px 18px rgba(240, 67, 72, 0.18);
         }
 
         .stButton > button:hover,
         .stDownloadButton > button:hover {
-            border-color: var(--att-primary-dark);
-            background: var(--att-primary-dark);
-            color: #ffffff;
+            border-color: var(--att-amber);
+            background: var(--att-amber);
+            color: var(--att-ink);
         }
 
         .st-key-admin_decision_accept button,
@@ -219,8 +298,8 @@ def apply_professional_theme() -> None:
 
         .st-key-admin_decision_reject button,
         .st-key-observer_decision_reject button {
-            background: var(--att-rose) !important;
-            border-color: var(--att-rose) !important;
+            background: var(--att-red) !important;
+            border-color: var(--att-red) !important;
             color: #ffffff !important;
             box-shadow: 0 8px 18px rgba(225, 29, 72, 0.22) !important;
         }
@@ -275,6 +354,10 @@ def main() -> None:
 
     with st.sidebar:
         st.title("Attendance")
+        st.markdown(
+            '<div class="attendance-accent-line"><span></span><span></span><span></span><span></span></div>',
+            unsafe_allow_html=True,
+        )
         selected_page = st.radio(
             "Open page",
             options=list(PAGES.keys()),
