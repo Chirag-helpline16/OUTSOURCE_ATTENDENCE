@@ -33,6 +33,7 @@ MONGODB_URI_ENV_VAR = "MONGODB_URI"
 MONGODB_DATABASE_ENV_VAR = "MONGODB_DATABASE"
 DEFAULT_MONGODB_DATABASE = "attendance_db"
 DEFAULT_ADMIN_PASSWORD = "admin123"
+ATTENDANCE_PERCENT_BASE_DAYS = 26
 VALID_USER_ROLES = {"observer", "outsource"}
 VALID_DECISIONS = {"accepted", "rejected"}
 SHIFT_ORDER = {"M": 1, "G": 2, "E": 3, "N": 4, "O": 5}
@@ -96,6 +97,23 @@ def _normalize_name(value: str) -> str:
 
 def _clean_pc_name(value: str) -> str:
     return " ".join(str(value or "").strip().upper().split())
+
+
+def _clean_joined_date(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+
+    text = _clean_text(value)
+    if not text:
+        return ""
+    for date_format in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(text, date_format).date().isoformat()
+        except ValueError:
+            continue
+    return text
 
 
 def _clean_ip_address(value: Any) -> str:
@@ -198,6 +216,7 @@ class AttendanceService:
                     role TEXT NOT NULL CHECK (role IN ('observer', 'outsource')),
                     agency TEXT,
                     designation TEXT,
+                    joined_date TEXT,
                     details TEXT,
                     active INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
@@ -269,6 +288,7 @@ class AttendanceService:
             "password_hash": "ALTER TABLE users ADD COLUMN password_hash TEXT",
             "agency": "ALTER TABLE users ADD COLUMN agency TEXT",
             "designation": "ALTER TABLE users ADD COLUMN designation TEXT",
+            "joined_date": "ALTER TABLE users ADD COLUMN joined_date TEXT",
             "details": "ALTER TABLE users ADD COLUMN details TEXT",
         }
         for column, statement in migrations.items():
@@ -318,6 +338,7 @@ class AttendanceService:
         mobile: str,
         password: str = "",
         designation: str = "",
+        joined_date: Any = "",
         details: str = "",
         created_by: str = "Admin",
     ) -> int:
@@ -338,6 +359,7 @@ class AttendanceService:
         if role == "observer":
             password_hash = hash_password(str(password or "").strip() or clean_mobile)
         timestamp = _timestamp()
+        clean_joined_date = _clean_joined_date(joined_date)
 
         with self._connect() as conn:
             try:
@@ -345,9 +367,9 @@ class AttendanceService:
                     """
                     INSERT INTO users (
                         name, normalized_name, mobile, normalized_mobile, password_hash,
-                        role, agency, designation, details, active, created_at, created_by, updated_at
+                        role, agency, designation, joined_date, details, active, created_at, created_by, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                     """,
                     (
                         clean_name,
@@ -358,6 +380,7 @@ class AttendanceService:
                         role,
                         "",
                         _clean_text(designation),
+                        clean_joined_date,
                         str(details or "").strip(),
                         timestamp,
                         created_by,
@@ -393,17 +416,19 @@ class AttendanceService:
                             password_hash = ?,
                             agency = ?,
                             designation = ?,
+                            joined_date = ?,
                             details = ?,
                             updated_at = ?
                         WHERE id = ?
                         """,
                         (
-                                clean_name,
-                                clean_mobile,
-                                clean_mobile,
-                                password_hash,
-                                "",
-                                _clean_text(designation),
+                            clean_name,
+                            clean_mobile,
+                            clean_mobile,
+                            password_hash,
+                            "",
+                            _clean_text(designation),
+                            clean_joined_date,
                             str(details or "").strip(),
                             timestamp,
                             row["id"],
@@ -429,6 +454,7 @@ class AttendanceService:
         mobile: str,
         role: str,
         designation: str = "",
+        joined_date: Any = "",
         details: str = "",
         password: str = "",
         actor_name: str = "Admin",
@@ -451,6 +477,7 @@ class AttendanceService:
             "normalized_mobile = ?",
             "role = ?",
             "designation = ?",
+            "joined_date = ?",
             "details = ?",
             "updated_at = ?",
         ]
@@ -461,6 +488,7 @@ class AttendanceService:
             clean_mobile,
             role,
             _clean_text(designation),
+            _clean_joined_date(joined_date),
             str(details or "").strip(),
             _timestamp(),
         ]
@@ -534,6 +562,7 @@ class AttendanceService:
                 mobile,
                 role,
                 designation,
+                joined_date,
                 details,
                 active,
                 CASE WHEN password_hash IS NULL OR password_hash = '' THEN 0 ELSE 1 END AS has_password,
@@ -963,9 +992,15 @@ class AttendanceService:
                         marker = "P"
                 row[column] = marker
             row["Total Present Days"] = present_days
+            row["Attendance %"] = round(
+                min(present_days, ATTENDANCE_PERCENT_BASE_DAYS)
+                / ATTENDANCE_PERCENT_BASE_DAYS
+                * 100,
+                2,
+            )
             rows.append(row)
 
-        return pd.DataFrame(rows, columns=["Name", *day_columns, "Total Present Days"])
+        return pd.DataFrame(rows, columns=["Name", *day_columns, "Total Present Days", "Attendance %"])
 
     def build_daily_summary_df(self, month: str) -> pd.DataFrame:
         parsed = datetime.strptime(month, "%Y-%m")
@@ -1117,7 +1152,8 @@ class AttendanceService:
                 values = [str(cell.value or "") for cell in column_cells]
                 width = min(max(max((len(value) for value in values), default=8) + 2, 10), 34)
                 if worksheet.title == "Monthly Attendance" and index > 1:
-                    width = 11 if index < worksheet.max_column else 18
+                    header = str(column_cells[2].value or "") if len(column_cells) >= 3 else ""
+                    width = 18 if header in {"Total Present Days", "Attendance %"} else 11
                 worksheet.column_dimensions[get_column_letter(index)].width = width
 
             worksheet.freeze_panes = "A4"
@@ -1209,6 +1245,7 @@ class MongoAttendanceService(AttendanceService):
         mobile: str,
         password: str = "",
         designation: str = "",
+        joined_date: Any = "",
         details: str = "",
         created_by: str = "Admin",
     ) -> int:
@@ -1233,6 +1270,7 @@ class MongoAttendanceService(AttendanceService):
             "password_hash": password_hash,
             "role": role,
             "designation": _clean_text(designation),
+            "joined_date": _clean_joined_date(joined_date),
             "details": str(details or "").strip(),
             "active": True,
             "created_at": timestamp,
@@ -1261,6 +1299,7 @@ class MongoAttendanceService(AttendanceService):
         mobile: str,
         role: str,
         designation: str = "",
+        joined_date: Any = "",
         details: str = "",
         password: str = "",
         actor_name: str = "Admin",
@@ -1282,6 +1321,7 @@ class MongoAttendanceService(AttendanceService):
             "normalized_mobile": clean_mobile,
             "role": role,
             "designation": _clean_text(designation),
+            "joined_date": _clean_joined_date(joined_date),
             "details": str(details or "").strip(),
             "updated_at": _timestamp(),
         }
@@ -1332,8 +1372,8 @@ class MongoAttendanceService(AttendanceService):
         docs = list(self.users.find(query).sort([("role", ASCENDING), ("active", DESCENDING), ("name", ASCENDING)]))
         df = self._docs_to_df(docs)
         columns = [
-            "id", "name", "mobile", "role", "designation", "details", "active",
-            "has_password", "created_at", "created_by", "updated_at",
+            "id", "name", "mobile", "role", "designation", "joined_date", "details",
+            "active", "has_password", "created_at", "created_by", "updated_at",
         ]
         if df.empty:
             return pd.DataFrame(columns=columns)
@@ -1578,6 +1618,16 @@ def _status_title(value: Any) -> str:
 def _display_ip_address(value: Any) -> str:
     clean_ip = _clean_ip_address(value)
     return clean_ip if clean_ip else "Not captured"
+
+
+def _date_input_default(value: Any) -> date:
+    clean_date = _clean_joined_date(value)
+    if clean_date:
+        try:
+            return datetime.strptime(clean_date, "%Y-%m-%d").date()
+        except ValueError:
+            pass
+    return now_ist().date()
 
 
 def _display_entries(df: pd.DataFrame, include_ip: bool = False) -> pd.DataFrame:
@@ -1936,6 +1986,12 @@ def render_attendance_admin_page() -> None:
                 name = st.text_input("Name")
                 mobile = st.text_input("Mobile number")
                 designation = st.text_input("Designation / Work detail")
+                joined_date = st.date_input(
+                    "Joined date",
+                    value=now_ist().date(),
+                    format="DD-MM-YYYY",
+                    key="create_attendance_joined_date",
+                )
                 if role == "observer":
                     password = st.text_input(
                         "Observer password",
@@ -1955,6 +2011,7 @@ def render_attendance_admin_page() -> None:
                             mobile=mobile,
                             password=password,
                             designation=designation,
+                            joined_date=joined_date,
                             details=details,
                             created_by=auth["name"],
                         )
@@ -1975,6 +2032,7 @@ def render_attendance_admin_page() -> None:
                         "mobile": "Mobile",
                         "role": "Role",
                         "designation": "Designation",
+                        "joined_date": "Joined Date",
                         "details": "Details",
                         "active": "Active",
                         "has_password": "Observer Password",
@@ -2036,6 +2094,12 @@ def render_attendance_admin_page() -> None:
                             "Designation / Work detail",
                             value=str(selected_row.get("designation") or ""),
                         )
+                        edit_joined_date = st.date_input(
+                            "Joined date",
+                            value=_date_input_default(selected_row.get("joined_date")),
+                            format="DD-MM-YYYY",
+                            key="edit_attendance_joined_date",
+                        )
                         if selected_row["role"] == "observer":
                             edit_password = st.text_input(
                                 "New observer password",
@@ -2059,6 +2123,7 @@ def render_attendance_admin_page() -> None:
                                     mobile=edit_mobile,
                                     role=edit_role,
                                     designation=edit_designation,
+                                    joined_date=edit_joined_date,
                                     details=edit_details,
                                     password=edit_password,
                                     actor_name=auth["name"],
@@ -2079,9 +2144,30 @@ def render_attendance_admin_page() -> None:
         matrix = service.build_monthly_attendance_df(month)
         st.caption(
             "Legend: M 07:00-08:59, G 09:00-12:59, E 13:00-16:59, "
-            "N 19:00-21:59, O other, P pending. Rejected entries are excluded."
+            f"N 19:00-21:59, O other, P pending. Attendance % is calculated from "
+            f"{ATTENDANCE_PERCENT_BASE_DAYS} working days. Rejected entries are excluded."
         )
-        st.dataframe(matrix, use_container_width=True, hide_index=True)
+        if not matrix.empty:
+            avg_attendance = float(matrix["Attendance %"].mean())
+            top_attendance = float(matrix["Attendance %"].max())
+            fully_present = int((matrix["Attendance %"] >= 100).sum())
+            att_col1, att_col2, att_col3 = st.columns(3)
+            att_col1.metric("Average Attendance", f"{avg_attendance:.2f}%")
+            att_col2.metric("Highest Attendance", f"{top_attendance:.2f}%")
+            att_col3.metric("100% Attendance", fully_present)
+        st.dataframe(
+            matrix,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Attendance %": st.column_config.ProgressColumn(
+                    "Attendance %",
+                    format="%.2f%%",
+                    min_value=0,
+                    max_value=100,
+                )
+            },
+        )
 
         st.markdown("---")
         st.subheader("Raw Login Data")

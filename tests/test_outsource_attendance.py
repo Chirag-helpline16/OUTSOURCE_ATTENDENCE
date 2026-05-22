@@ -92,6 +92,40 @@ def test_monthly_attendance_counts_only_accepted_days(tmp_path):
     assert row["02 Sat"] == "G/N"
     assert row["03 Sun"] == ""
     assert row["Total Present Days"] == 1
+    assert row["Attendance %"] == 3.85
+
+
+def test_monthly_attendance_percentage_uses_fixed_26_day_base(tmp_path):
+    service = AttendanceService(tmp_path / "attendance.sqlite")
+    outsource_id = service.add_user("Percentage User", "outsource", "9876543220")
+
+    for day in range(1, 27):
+        entry_id = service.submit_login(
+            outsource_id,
+            f"pc-{day}",
+            login_at=datetime(2026, 5, day, 9, 30, tzinfo=IST),
+        )
+        service.decide_entry(entry_id, "accepted", "admin", "Admin")
+
+    matrix = service.build_monthly_attendance_df("2026-05")
+    row = matrix[matrix["Name"] == "Percentage User"].iloc[0]
+
+    assert row["Total Present Days"] == 26
+    assert row["Attendance %"] == 100.0
+
+
+def test_user_joined_date_is_saved_and_exported(tmp_path):
+    service = AttendanceService(tmp_path / "attendance.sqlite")
+    user_id = service.add_user(
+        "Joined User",
+        "outsource",
+        "9876543221",
+        joined_date="17-05-2026",
+    )
+
+    users = service.list_users(role="outsource")
+
+    assert users[users["id"] == user_id].iloc[0]["joined_date"] == "2026-05-17"
 
 
 def test_pending_filter_only_includes_entries_with_no_decision(tmp_path):
@@ -239,4 +273,7 @@ def test_existing_old_user_table_is_migrated(tmp_path):
         role="outsource",
     )
 
+    users = service.list_users(role="outsource")
+
     assert service.authenticate_outsource_user(1, "9876543216")["name"] == "Old User"
+    assert "joined_date" in users.columns

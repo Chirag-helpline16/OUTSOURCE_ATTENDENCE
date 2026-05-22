@@ -1,6 +1,7 @@
 # Outsource Attendance App
 
 Standalone Streamlit app for outsource attendance login, observer approval, admin override, IP capture, and Excel export.
+The app uses a professional light theme with a white background.
 
 ## Run Locally
 
@@ -26,6 +27,16 @@ If `MONGODB_URI` is not provided, the app stores data in local SQLite at `data/o
 - `Outsource Login`: outsource user selects name, verifies mobile number, enters PC name, and submits login.
 - `Observer Desk`: observer accepts or rejects pending entries.
 - `Admin Panel`: admin creates users, overrides decisions, views attendance, sees captured IP address, and exports Excel.
+
+## Attendance Percentage
+
+Monthly attendance percentage is calculated from a fixed 26-day base:
+
+```text
+Attendance % = Total Present Days / 26 * 100
+```
+
+The value is capped at `100%`.
 
 ## GitHub Push
 
