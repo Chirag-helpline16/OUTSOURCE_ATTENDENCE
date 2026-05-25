@@ -165,6 +165,69 @@ def _month_label(month: str) -> str:
     return parsed.strftime("%B %Y")
 
 
+def _month_bounds(month: str) -> tuple[str, str]:
+    parsed = datetime.strptime(month, "%Y-%m")
+    start = date(parsed.year, parsed.month, 1)
+    if parsed.month == 12:
+        end = date(parsed.year + 1, 1, 1)
+    else:
+        end = date(parsed.year, parsed.month + 1, 1)
+    return start.isoformat(), end.isoformat()
+
+
+def _normalized_status_filter(status_filter: str | None) -> str:
+    return str(status_filter or "").strip().lower()
+
+
+def _append_sql_status_filter(
+    clauses: list[str],
+    params: list[Any],
+    status_filter: str | None,
+) -> None:
+    status = _normalized_status_filter(status_filter)
+    if not status or status == "all":
+        return
+    if status == "pending":
+        clauses.append("e.admin_status IS NULL AND e.observer_status IS NULL")
+        return
+    if status in VALID_DECISIONS:
+        clauses.append(
+            """
+            (
+                e.admin_status = ?
+                OR (e.admin_status IS NULL AND e.observer_status = ?)
+            )
+            """
+        )
+        params.extend([status, status])
+        return
+    clauses.append("COALESCE(e.admin_status, e.observer_status, 'pending') = ?")
+    params.append(status)
+
+
+def _mongo_status_filter(status_filter: str | None) -> dict[str, Any]:
+    status = _normalized_status_filter(status_filter)
+    if not status or status == "all":
+        return {}
+    if status == "pending":
+        return {"admin_status": None, "observer_status": None}
+    if status in VALID_DECISIONS:
+        return {
+            "$or": [
+                {"admin_status": status},
+                {"admin_status": None, "observer_status": status},
+            ]
+        }
+    return {
+        "$expr": {
+            "$eq": [
+                {"$ifNull": ["$admin_status", {"$ifNull": ["$observer_status", "pending"]}]},
+                status,
+            ]
+        }
+    }
+
+
 def _get_config_value(key: str, default: str = "") -> str:
     env_value = os.environ.get(key)
     if env_value:
@@ -203,9 +266,10 @@ class AttendanceService:
         self.initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=15)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 15000")
         return conn
 
     def initialize(self) -> None:
@@ -233,6 +297,9 @@ class AttendanceService:
 
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_att_users_role_name
                 ON users(role, normalized_name);
+
+                CREATE INDEX IF NOT EXISTS idx_att_users_role_active_name
+                ON users(role, active, name COLLATE NOCASE);
 
                 CREATE TABLE IF NOT EXISTS login_entries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -263,8 +330,17 @@ class AttendanceService:
                 CREATE INDEX IF NOT EXISTS idx_att_entries_login_date
                 ON login_entries(login_date);
 
+                CREATE INDEX IF NOT EXISTS idx_att_entries_date_time_id
+                ON login_entries(login_date, login_time_ist DESC, id DESC);
+
                 CREATE INDEX IF NOT EXISTS idx_att_entries_user_date
                 ON login_entries(outsource_user_id, login_date);
+
+                CREATE INDEX IF NOT EXISTS idx_att_entries_user_date_time_id
+                ON login_entries(outsource_user_id, login_date, login_time_ist DESC, id DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_att_entries_status_date
+                ON login_entries(admin_status, observer_status, login_date);
 
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -787,17 +863,24 @@ class AttendanceService:
         month: str | None = None,
         status_filter: str | None = None,
         outsource_user_id: int | None = None,
+        limit: int | None = None,
     ) -> pd.DataFrame:
         clauses: list[str] = []
         params: list[Any] = []
         if month:
-            clauses.append("substr(e.login_date, 1, 7) = ?")
-            params.append(month)
+            start_date, end_date = _month_bounds(month)
+            clauses.append("e.login_date >= ? AND e.login_date < ?")
+            params.extend([start_date, end_date])
         if outsource_user_id:
             clauses.append("e.outsource_user_id = ?")
             params.append(outsource_user_id)
+        _append_sql_status_filter(clauses, params, status_filter)
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        limit_clause = ""
+        if limit is not None:
+            limit_clause = "LIMIT ?"
+            params.append(max(int(limit), 0))
         query = f"""
             SELECT
                 e.id,
@@ -823,16 +906,12 @@ class AttendanceService:
             LEFT JOIN users u ON u.id = e.outsource_user_id
             {where}
             ORDER BY e.login_time_ist DESC, e.id DESC
+            {limit_clause}
         """
         with self._connect() as conn:
             df = pd.read_sql_query(query, conn, params=params)
 
-        if df.empty:
-            return self._with_status_columns(df)
-
         df = self._with_status_columns(df)
-        if status_filter and status_filter.lower() != "all":
-            df = df[df["effective_status"] == status_filter.lower()].copy()
         return df.reset_index(drop=True)
 
     def _with_status_columns(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -862,27 +941,48 @@ class AttendanceService:
         return [row["month"] for row in rows if row["month"]]
 
     def get_summary_metrics(self) -> dict[str, int]:
-        entries = self.list_entries()
-        users = self.list_users()
         today = now_ist().date().isoformat()
-        if entries.empty:
-            return {
-                "pending": 0,
-                "accepted": 0,
-                "rejected": 0,
-                "today_logins": 0,
-                "observer_users": int((users["role"] == "observer").sum()) if not users.empty else 0,
-                "outsource_users": int((users["role"] == "outsource").sum()) if not users.empty else 0,
+        with self._connect() as conn:
+            entry_counts = conn.execute(
+                """
+                SELECT
+                    SUM(CASE
+                        WHEN admin_status IS NULL AND observer_status IS NULL THEN 1
+                        ELSE 0
+                    END) AS pending,
+                    SUM(CASE
+                        WHEN admin_status = 'accepted'
+                            OR (admin_status IS NULL AND observer_status = 'accepted') THEN 1
+                        ELSE 0
+                    END) AS accepted,
+                    SUM(CASE
+                        WHEN admin_status = 'rejected'
+                            OR (admin_status IS NULL AND observer_status = 'rejected') THEN 1
+                        ELSE 0
+                    END) AS rejected,
+                    SUM(CASE WHEN login_date = ? THEN 1 ELSE 0 END) AS today_logins
+                FROM login_entries
+                """,
+                (today,),
+            ).fetchone()
+            user_counts = {
+                row["role"]: int(row["count"])
+                for row in conn.execute(
+                    """
+                    SELECT role, COUNT(*) AS count
+                    FROM users
+                    GROUP BY role
+                    """
+                ).fetchall()
             }
 
-        status_counts = entries["effective_status"].value_counts()
         return {
-            "pending": int(status_counts.get("pending", 0)),
-            "accepted": int(status_counts.get("accepted", 0)),
-            "rejected": int(status_counts.get("rejected", 0)),
-            "today_logins": int((entries["login_date"] == today).sum()),
-            "observer_users": int((users["role"] == "observer").sum()) if not users.empty else 0,
-            "outsource_users": int((users["role"] == "outsource").sum()) if not users.empty else 0,
+            "pending": int(entry_counts["pending"] or 0),
+            "accepted": int(entry_counts["accepted"] or 0),
+            "rejected": int(entry_counts["rejected"] or 0),
+            "today_logins": int(entry_counts["today_logins"] or 0),
+            "observer_users": user_counts.get("observer", 0),
+            "outsource_users": user_counts.get("outsource", 0),
         }
 
     def build_raw_attendance_df(self, month: str | None = None) -> pd.DataFrame:
@@ -971,32 +1071,47 @@ class AttendanceService:
             names.extend(entries["outsource_name"].dropna().tolist())
         unique_names = sorted(dict.fromkeys(names), key=str.casefold)
 
+        accepted_dates: set[tuple[str, str]] = set()
+        pending_dates: set[tuple[str, str]] = set()
+        accepted_shifts: dict[tuple[str, str], set[str]] = {}
+        if not entries.empty:
+            accepted_entries = entries[entries["effective_status"] == "accepted"]
+            for row in accepted_entries.itertuples(index=False):
+                name = str(getattr(row, "outsource_name") or "")
+                login_date = str(getattr(row, "login_date") or "")
+                if not name or not login_date:
+                    continue
+                key = (name, login_date)
+                accepted_dates.add(key)
+                shift_code = getattr(row, "shift_code", None)
+                if pd.notna(shift_code) and str(shift_code):
+                    accepted_shifts.setdefault(key, set()).add(str(shift_code))
+
+            pending_entries = entries[entries["effective_status"] == "pending"]
+            for row in pending_entries.itertuples(index=False):
+                name = str(getattr(row, "outsource_name") or "")
+                login_date = str(getattr(row, "login_date") or "")
+                if name and login_date:
+                    pending_dates.add((name, login_date))
+
         rows: list[dict[str, Any]] = []
         for name in unique_names:
             row: dict[str, Any] = {"Name": name}
             present_days = 0
-            employee_entries = (
-                entries[entries["outsource_name"] == name].copy()
-                if not entries.empty
-                else pd.DataFrame()
-            )
 
             for day, column in enumerate(day_columns, start=1):
                 current_date = date(parsed.year, parsed.month, day).isoformat()
                 marker = ""
-                if not employee_entries.empty:
-                    day_entries = employee_entries[employee_entries["login_date"] == current_date]
-                    accepted = day_entries[day_entries["effective_status"] == "accepted"]
-                    pending = day_entries[day_entries["effective_status"] == "pending"]
-                    if not accepted.empty:
-                        shifts = sorted(
-                            accepted["shift_code"].dropna().unique().tolist(),
-                            key=lambda code: SHIFT_ORDER.get(code, 99),
-                        )
-                        marker = "/".join(shifts)
-                        present_days += 1
-                    elif not pending.empty:
-                        marker = "P"
+                key = (name, current_date)
+                if key in accepted_dates:
+                    shifts = sorted(
+                        accepted_shifts.get(key, set()),
+                        key=lambda code: SHIFT_ORDER.get(code, 99),
+                    )
+                    marker = "/".join(shifts)
+                    present_days += 1
+                elif key in pending_dates:
+                    marker = "P"
                 row[column] = marker
             row["Total Present Days"] = present_days
             row["Attendance %"] = round(
@@ -1014,38 +1129,43 @@ class AttendanceService:
         days_in_month = calendar.monthrange(parsed.year, parsed.month)[1]
         entries = self.list_entries(month=month)
         rows: list[dict[str, Any]] = []
+        total_by_date: dict[str, int] = {}
+        status_by_date: dict[tuple[str, str], int] = {}
+        shift_by_date: dict[tuple[str, str], int] = {}
+
+        if not entries.empty:
+            total_by_date = entries.groupby("login_date").size().astype(int).to_dict()
+            status_by_date = (
+                entries.groupby(["login_date", "effective_status"])
+                .size()
+                .astype(int)
+                .to_dict()
+            )
+            accepted_entries = entries[entries["effective_status"] == "accepted"]
+            if not accepted_entries.empty:
+                shift_by_date = (
+                    accepted_entries.groupby(["login_date", "shift_code"])
+                    .size()
+                    .astype(int)
+                    .to_dict()
+                )
 
         for day in range(1, days_in_month + 1):
             current = date(parsed.year, parsed.month, day)
-            current_entries = (
-                entries[entries["login_date"] == current.isoformat()]
-                if not entries.empty
-                else pd.DataFrame()
-            )
-            accepted = (
-                current_entries[current_entries["effective_status"] == "accepted"]
-                if not current_entries.empty
-                else pd.DataFrame()
-            )
+            current_key = current.isoformat()
             rows.append(
                 {
-                    "Date": current.isoformat(),
+                    "Date": current_key,
                     "Day": current.strftime("%A"),
-                    "Total Logins": int(len(current_entries)),
-                    "Accepted": int((current_entries["effective_status"] == "accepted").sum())
-                    if not current_entries.empty
-                    else 0,
-                    "Rejected": int((current_entries["effective_status"] == "rejected").sum())
-                    if not current_entries.empty
-                    else 0,
-                    "Pending": int((current_entries["effective_status"] == "pending").sum())
-                    if not current_entries.empty
-                    else 0,
-                    "Morning": int((accepted["shift_code"] == "M").sum()) if not accepted.empty else 0,
-                    "General": int((accepted["shift_code"] == "G").sum()) if not accepted.empty else 0,
-                    "Evening": int((accepted["shift_code"] == "E").sum()) if not accepted.empty else 0,
-                    "Night": int((accepted["shift_code"] == "N").sum()) if not accepted.empty else 0,
-                    "Other": int((accepted["shift_code"] == "O").sum()) if not accepted.empty else 0,
+                    "Total Logins": total_by_date.get(current_key, 0),
+                    "Accepted": status_by_date.get((current_key, "accepted"), 0),
+                    "Rejected": status_by_date.get((current_key, "rejected"), 0),
+                    "Pending": status_by_date.get((current_key, "pending"), 0),
+                    "Morning": shift_by_date.get((current_key, "M"), 0),
+                    "General": shift_by_date.get((current_key, "G"), 0),
+                    "Evening": shift_by_date.get((current_key, "E"), 0),
+                    "Night": shift_by_date.get((current_key, "N"), 0),
+                    "Other": shift_by_date.get((current_key, "O"), 0),
                 }
             )
 
@@ -1194,6 +1314,10 @@ class MongoAttendanceService(AttendanceService):
             name="idx_att_users_role_name",
         )
         self.users.create_index(
+            [("role", ASCENDING), ("active", DESCENDING), ("name", ASCENDING)],
+            name="idx_att_users_role_active_name",
+        )
+        self.users.create_index(
             [("role", ASCENDING), ("normalized_mobile", ASCENDING)],
             unique=True,
             sparse=True,
@@ -1201,8 +1325,25 @@ class MongoAttendanceService(AttendanceService):
         )
         self.entries.create_index([("login_date", ASCENDING)], name="idx_att_entries_login_date")
         self.entries.create_index(
+            [("login_date", ASCENDING), ("login_time_ist", DESCENDING), ("id", DESCENDING)],
+            name="idx_att_entries_date_time_id",
+        )
+        self.entries.create_index(
             [("outsource_user_id", ASCENDING), ("login_date", ASCENDING)],
             name="idx_att_entries_user_date",
+        )
+        self.entries.create_index(
+            [
+                ("outsource_user_id", ASCENDING),
+                ("login_date", ASCENDING),
+                ("login_time_ist", DESCENDING),
+                ("id", DESCENDING),
+            ],
+            name="idx_att_entries_user_date_time_id",
+        )
+        self.entries.create_index(
+            [("admin_status", ASCENDING), ("observer_status", ASCENDING), ("login_date", ASCENDING)],
+            name="idx_att_entries_status_date",
         )
         self.audit.create_index([("created_at", DESCENDING)], name="idx_att_audit_created_at")
 
@@ -1539,18 +1680,80 @@ class MongoAttendanceService(AttendanceService):
         month: str | None = None,
         status_filter: str | None = None,
         outsource_user_id: int | None = None,
+        limit: int | None = None,
     ) -> pd.DataFrame:
         query: dict[str, Any] = {}
         if month:
-            query["login_date"] = {"$regex": f"^{month}"}
+            start_date, end_date = _month_bounds(month)
+            query["login_date"] = {"$gte": start_date, "$lt": end_date}
         if outsource_user_id:
             query["outsource_user_id"] = int(outsource_user_id)
-        docs = list(self.entries.find(query).sort([("login_time_ist", DESCENDING), ("id", DESCENDING)]))
+        query.update(_mongo_status_filter(status_filter))
+        cursor = self.entries.find(query).sort([("login_time_ist", DESCENDING), ("id", DESCENDING)])
+        if limit is not None:
+            cursor = cursor.limit(max(int(limit), 0))
+        docs = list(cursor)
         df = self._docs_to_df(docs)
         df = self._with_status_columns(df)
-        if not df.empty and status_filter and status_filter.lower() != "all":
-            df = df[df["effective_status"] == status_filter.lower()].copy()
         return df.reset_index(drop=True)
+
+    def get_summary_metrics(self) -> dict[str, int]:
+        today = now_ist().date().isoformat()
+        entry_counts = list(
+            self.entries.aggregate(
+                [
+                    {
+                        "$project": {
+                            "login_date": 1,
+                            "effective_status": {
+                                "$ifNull": [
+                                    "$admin_status",
+                                    {"$ifNull": ["$observer_status", "pending"]},
+                                ]
+                            },
+                        }
+                    },
+                    {
+                        "$group": {
+                            "_id": None,
+                            "pending": {
+                                "$sum": {
+                                    "$cond": [{"$eq": ["$effective_status", "pending"]}, 1, 0]
+                                }
+                            },
+                            "accepted": {
+                                "$sum": {
+                                    "$cond": [{"$eq": ["$effective_status", "accepted"]}, 1, 0]
+                                }
+                            },
+                            "rejected": {
+                                "$sum": {
+                                    "$cond": [{"$eq": ["$effective_status", "rejected"]}, 1, 0]
+                                }
+                            },
+                            "today_logins": {
+                                "$sum": {"$cond": [{"$eq": ["$login_date", today]}, 1, 0]}
+                            },
+                        }
+                    },
+                ]
+            )
+        )
+        user_counts = {
+            row["_id"]: int(row["count"])
+            for row in self.users.aggregate(
+                [{"$group": {"_id": "$role", "count": {"$sum": 1}}}]
+            )
+        }
+        counts = entry_counts[0] if entry_counts else {}
+        return {
+            "pending": int(counts.get("pending", 0)),
+            "accepted": int(counts.get("accepted", 0)),
+            "rejected": int(counts.get("rejected", 0)),
+            "today_logins": int(counts.get("today_logins", 0)),
+            "observer_users": user_counts.get("observer", 0),
+            "outsource_users": user_counts.get("outsource", 0),
+        }
 
     def get_available_months(self) -> list[str]:
         dates = [value for value in self.entries.distinct("login_date") if value]
@@ -1579,6 +1782,7 @@ class MongoAttendanceService(AttendanceService):
         )
 
 
+@st.cache_resource(show_spinner=False)
 def get_attendance_service() -> AttendanceService:
     """Return MongoDB storage when configured, otherwise local SQLite."""
     mongodb_uri = _get_config_value(MONGODB_URI_ENV_VAR)
@@ -1911,6 +2115,298 @@ def _render_decision_form(
             save_decision("rejected")
 
 
+ADMIN_SECTIONS = ["Approvals", "Users", "Attendance", "Export", "Audit"]
+OBSERVER_VIEWS = ["Pending", "All Entries"]
+
+
+def _render_admin_approvals(service: AttendanceService, auth: dict[str, Any]) -> None:
+    st.subheader("Admin Decisions")
+    filter_col1, filter_col2, filter_col3 = st.columns(3)
+    month = filter_col1.selectbox(
+        "Month",
+        options=_month_options(service),
+        format_func=_month_label,
+        key="admin_entries_month",
+    )
+    status = filter_col2.selectbox(
+        "Current status",
+        options=["all", "pending", "accepted", "rejected"],
+        format_func=_status_title,
+        key="admin_entries_status",
+    )
+    outsource_users = service.list_users(role="outsource")
+    outsource_options = {"All": None}
+    if not outsource_users.empty:
+        outsource_options.update(
+            {row["name"]: int(row["id"]) for _, row in outsource_users.iterrows()}
+        )
+    outsource_name = filter_col3.selectbox(
+        "Outsource user",
+        options=list(outsource_options.keys()),
+        key="admin_entries_user",
+    )
+    entries = service.list_entries(
+        month=month,
+        status_filter=status,
+        outsource_user_id=outsource_options[outsource_name],
+    )
+    if not entries.empty:
+        ip_values = entries["ip_address"] if "ip_address" in entries.columns else pd.Series([""] * len(entries))
+        ip_captured = ip_values.fillna("").astype(str).str.strip().astype(bool).sum()
+        st.caption(
+            f"IP captured for {ip_captured} of {len(entries)} visible entries. "
+            "Old entries may show Not captured."
+        )
+    st.dataframe(
+        _display_entries(entries, include_ip=True)
+        if not entries.empty
+        else _empty_entries_display(include_ip=True),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("---")
+    st.caption(f"Decision by: {auth['name']}")
+    st.caption("Use Current status = All to override accepted or rejected entries anytime.")
+    _render_decision_form(
+        service=service,
+        entries=entries,
+        actor_role="admin",
+        actor_name=auth["name"],
+        key_prefix="admin_decision",
+        show_ip=True,
+    )
+
+
+def _render_admin_users(service: AttendanceService, auth: dict[str, Any]) -> None:
+    st.subheader("User Management")
+    create_col, list_col = st.columns([0.35, 0.65])
+    with create_col:
+        role = st.radio(
+            "User type",
+            options=["observer", "outsource"],
+            format_func=_status_title,
+            horizontal=True,
+            key="create_attendance_user_role",
+        )
+        with st.form("create_attendance_user"):
+            name = st.text_input("Name")
+            mobile = st.text_input("Mobile number")
+            designation = st.text_input("Designation / Work detail")
+            joined_date = st.date_input(
+                "Joined date",
+                value=now_ist().date(),
+                format="DD-MM-YYYY",
+                key="create_attendance_joined_date",
+            )
+            if role == "observer":
+                password = st.text_input(
+                    "Observer password",
+                    type="password",
+                    help="Leave blank to use the mobile number as the first password.",
+                )
+            else:
+                password = ""
+                st.caption("Outsource users verify login with their registered mobile number.")
+            details = st.text_area("Other details", placeholder="Optional notes for admin records.")
+            submitted = st.form_submit_button("Create User", type="primary", use_container_width=True)
+            if submitted:
+                try:
+                    service.add_user(
+                        name=name,
+                        role=role,
+                        mobile=mobile,
+                        password=password,
+                        designation=designation,
+                        joined_date=joined_date,
+                        details=details,
+                        created_by=auth["name"],
+                    )
+                    st.success("User saved.")
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+
+    with list_col:
+        users = service.list_users()
+        if users.empty:
+            st.info("No users created yet.")
+            return
+
+        display_users = users.rename(
+            columns={
+                "id": "User ID",
+                "name": "Name",
+                "mobile": "Mobile",
+                "role": "Role",
+                "designation": "Designation",
+                "joined_date": "Joined Date",
+                "details": "Details",
+                "active": "Active",
+                "has_password": "Observer Password",
+                "created_at": "Created At",
+                "created_by": "Created By",
+                "updated_at": "Updated At",
+            }
+        )
+        display_users["Role"] = display_users["Role"].map(_status_title)
+        display_users["Observer Password"] = [
+            "Not needed" if role == "Outsource" else ("Yes" if has_password else "No")
+            for role, has_password in zip(
+                display_users["Role"],
+                display_users["Observer Password"],
+            )
+        ]
+        st.dataframe(display_users, use_container_width=True, hide_index=True)
+
+        user_options = {
+            f"#{row['id']} | {row['name']} | {_status_title(row['role'])} | "
+            f"{'Active' if row['active'] else 'Inactive'}": int(row["id"])
+            for _, row in users.iterrows()
+        }
+        selected_user = st.selectbox(
+            "Activate or deactivate user",
+            options=list(user_options.keys()),
+            key="admin_toggle_user",
+        )
+        selected_row = users[users["id"] == user_options[selected_user]].iloc[0]
+        next_state = not bool(selected_row["active"])
+        action_col, edit_col = st.columns(2)
+        with action_col:
+            if st.button(
+                "Reactivate User" if next_state else "Deactivate User",
+                use_container_width=True,
+                key="admin_toggle_user_btn",
+            ):
+                service.set_user_active(
+                    user_id=int(selected_row["id"]),
+                    active=next_state,
+                    actor_name=auth["name"],
+                )
+                st.success("User status updated.")
+                st.rerun()
+
+        with edit_col:
+            st.caption("Use the form below to reset password or correct details.")
+
+        with st.expander("Edit Selected User / Reset Password", expanded=False):
+            with st.form("edit_attendance_user"):
+                edit_name = st.text_input("Name", value=str(selected_row["name"]))
+                edit_mobile = st.text_input("Mobile number", value=str(selected_row.get("mobile") or ""))
+                edit_role = st.selectbox(
+                    "User type",
+                    options=["observer", "outsource"],
+                    index=0 if selected_row["role"] == "observer" else 1,
+                    format_func=_status_title,
+                )
+                edit_designation = st.text_input(
+                    "Designation / Work detail",
+                    value=str(selected_row.get("designation") or ""),
+                )
+                edit_joined_date = st.date_input(
+                    "Joined date",
+                    value=_date_input_default(selected_row.get("joined_date")),
+                    format="DD-MM-YYYY",
+                    key="edit_attendance_joined_date",
+                )
+                if selected_row["role"] == "observer":
+                    edit_password = st.text_input(
+                        "New observer password",
+                        type="password",
+                        help="Leave blank to keep the current password.",
+                    )
+                else:
+                    edit_password = ""
+                    st.caption("Outsource users do not need a password; mobile number is used.")
+                edit_details = st.text_area("Other details", value=str(selected_row.get("details") or ""))
+                update_submitted = st.form_submit_button(
+                    "Update User",
+                    type="primary",
+                    use_container_width=True,
+                )
+                if update_submitted:
+                    try:
+                        service.update_user_profile(
+                            user_id=int(selected_row["id"]),
+                            name=edit_name,
+                            mobile=edit_mobile,
+                            role=edit_role,
+                            designation=edit_designation,
+                            joined_date=edit_joined_date,
+                            details=edit_details,
+                            password=edit_password,
+                            actor_name=auth["name"],
+                        )
+                        st.success("User updated.")
+                        st.rerun()
+                    except ValueError as exc:
+                        st.error(str(exc))
+
+
+def _render_admin_attendance(service: AttendanceService) -> None:
+    st.subheader("Attendance Register")
+    month = st.selectbox(
+        "Attendance month",
+        options=_month_options(service),
+        format_func=_month_label,
+        key="admin_att_month",
+    )
+    matrix = service.build_monthly_attendance_df(month)
+    st.caption(
+        "Legend: M 07:00-08:59, G 09:00-12:59, E 13:00-16:59, "
+        f"N 19:00-21:59, O other, P pending. Attendance % is calculated from "
+        f"{ATTENDANCE_PERCENT_BASE_DAYS} working days. Rejected entries are excluded."
+    )
+    if not matrix.empty:
+        avg_attendance = float(matrix["Attendance %"].mean())
+        top_attendance = float(matrix["Attendance %"].max())
+        fully_present = int((matrix["Attendance %"] >= 100).sum())
+        att_col1, att_col2, att_col3 = st.columns(3)
+        att_col1.metric("Average Attendance", f"{avg_attendance:.2f}%")
+        att_col2.metric("Highest Attendance", f"{top_attendance:.2f}%")
+        att_col3.metric("100% Attendance", fully_present)
+    st.dataframe(
+        matrix,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Attendance %": st.column_config.ProgressColumn(
+                "Attendance %",
+                format="%.2f%%",
+                min_value=0,
+                max_value=100,
+            )
+        },
+    )
+
+    st.markdown("---")
+    st.subheader("Raw Login Data")
+    st.dataframe(service.build_raw_attendance_df(month), use_container_width=True, hide_index=True)
+
+
+def _render_admin_export(service: AttendanceService) -> None:
+    st.subheader("Excel Export")
+    month = st.selectbox(
+        "Export month",
+        options=_month_options(service),
+        format_func=_month_label,
+        key="admin_export_month",
+    )
+    excel_bytes = service.export_attendance_workbook(month)
+    st.download_button(
+        "Download Attendance Excel",
+        data=excel_bytes,
+        file_name=f"outsource_attendance_{month}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+
+def _render_admin_audit(service: AttendanceService) -> None:
+    st.subheader("Audit Trail")
+    st.dataframe(service.get_audit_log(limit=1000), use_container_width=True, hide_index=True)
+
+
 def render_attendance_admin_page() -> None:
     service = get_attendance_service()
     auth = _require_admin_auth()
@@ -1923,286 +2419,24 @@ def render_attendance_admin_page() -> None:
     _render_metrics(service.get_summary_metrics())
     st.markdown("---")
 
-    tabs = st.tabs(["Approvals", "Users", "Attendance", "Export", "Audit"])
+    section = st.radio(
+        "Admin section",
+        options=ADMIN_SECTIONS,
+        horizontal=True,
+        key="admin_section",
+    )
+    st.markdown("---")
 
-    with tabs[0]:
-        st.subheader("Admin Decisions")
-        filter_col1, filter_col2, filter_col3 = st.columns(3)
-        month = filter_col1.selectbox(
-            "Month",
-            options=_month_options(service),
-            format_func=_month_label,
-            key="admin_entries_month",
-        )
-        status = filter_col2.selectbox(
-            "Current status",
-            options=["all", "pending", "accepted", "rejected"],
-            format_func=_status_title,
-            key="admin_entries_status",
-        )
-        outsource_users = service.list_users(role="outsource")
-        outsource_options = {"All": None}
-        if not outsource_users.empty:
-            outsource_options.update(
-                {row["name"]: int(row["id"]) for _, row in outsource_users.iterrows()}
-            )
-        outsource_name = filter_col3.selectbox(
-            "Outsource user",
-            options=list(outsource_options.keys()),
-            key="admin_entries_user",
-        )
-        entries = service.list_entries(
-            month=month,
-            status_filter=status,
-            outsource_user_id=outsource_options[outsource_name],
-        )
-        if not entries.empty:
-            ip_values = entries["ip_address"] if "ip_address" in entries.columns else pd.Series([""] * len(entries))
-            ip_captured = ip_values.fillna("").astype(str).str.strip().astype(bool).sum()
-            st.caption(f"IP captured for {ip_captured} of {len(entries)} visible entries. Old entries may show Not captured.")
-        st.dataframe(
-            _display_entries(entries, include_ip=True)
-            if not entries.empty
-            else _empty_entries_display(include_ip=True),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        st.markdown("---")
-        st.caption(f"Decision by: {auth['name']}")
-        st.caption("Use Current status = All to override accepted or rejected entries anytime.")
-        action_entries = entries
-        _render_decision_form(
-            service=service,
-            entries=action_entries,
-            actor_role="admin",
-            actor_name=auth["name"],
-            key_prefix="admin_decision",
-            show_ip=True,
-        )
-
-    with tabs[1]:
-        st.subheader("User Management")
-        create_col, list_col = st.columns([0.35, 0.65])
-        with create_col:
-            role = st.radio(
-                "User type",
-                options=["observer", "outsource"],
-                format_func=_status_title,
-                horizontal=True,
-                key="create_attendance_user_role",
-            )
-            with st.form("create_attendance_user"):
-                name = st.text_input("Name")
-                mobile = st.text_input("Mobile number")
-                designation = st.text_input("Designation / Work detail")
-                joined_date = st.date_input(
-                    "Joined date",
-                    value=now_ist().date(),
-                    format="DD-MM-YYYY",
-                    key="create_attendance_joined_date",
-                )
-                if role == "observer":
-                    password = st.text_input(
-                        "Observer password",
-                        type="password",
-                        help="Leave blank to use the mobile number as the first password.",
-                    )
-                else:
-                    password = ""
-                    st.caption("Outsource users verify login with their registered mobile number.")
-                details = st.text_area("Other details", placeholder="Optional notes for admin records.")
-                submitted = st.form_submit_button("Create User", type="primary", use_container_width=True)
-                if submitted:
-                    try:
-                        service.add_user(
-                            name=name,
-                            role=role,
-                            mobile=mobile,
-                            password=password,
-                            designation=designation,
-                            joined_date=joined_date,
-                            details=details,
-                            created_by=auth["name"],
-                        )
-                        st.success("User saved.")
-                        st.rerun()
-                    except ValueError as exc:
-                        st.error(str(exc))
-
-        with list_col:
-            users = service.list_users()
-            if users.empty:
-                st.info("No users created yet.")
-            else:
-                display_users = users.rename(
-                    columns={
-                        "id": "User ID",
-                        "name": "Name",
-                        "mobile": "Mobile",
-                        "role": "Role",
-                        "designation": "Designation",
-                        "joined_date": "Joined Date",
-                        "details": "Details",
-                        "active": "Active",
-                        "has_password": "Observer Password",
-                        "created_at": "Created At",
-                        "created_by": "Created By",
-                        "updated_at": "Updated At",
-                    }
-                )
-                display_users["Role"] = display_users["Role"].map(_status_title)
-                display_users["Observer Password"] = display_users.apply(
-                    lambda row: "Not needed"
-                    if row["Role"] == "Outsource"
-                    else ("Yes" if row["Observer Password"] else "No"),
-                    axis=1,
-                )
-                st.dataframe(display_users, use_container_width=True, hide_index=True)
-
-                user_options = {
-                    f"#{row['id']} | {row['name']} | {_status_title(row['role'])} | "
-                    f"{'Active' if row['active'] else 'Inactive'}": int(row["id"])
-                    for _, row in users.iterrows()
-                }
-                selected_user = st.selectbox(
-                    "Activate or deactivate user",
-                    options=list(user_options.keys()),
-                    key="admin_toggle_user",
-                )
-                selected_row = users[users["id"] == user_options[selected_user]].iloc[0]
-                next_state = not bool(selected_row["active"])
-                action_col, edit_col = st.columns(2)
-                with action_col:
-                    if st.button(
-                        "Reactivate User" if next_state else "Deactivate User",
-                        use_container_width=True,
-                        key="admin_toggle_user_btn",
-                    ):
-                        service.set_user_active(
-                            user_id=int(selected_row["id"]),
-                            active=next_state,
-                            actor_name=auth["name"],
-                        )
-                        st.success("User status updated.")
-                        st.rerun()
-
-                with edit_col:
-                    st.caption("Use the form below to reset password or correct details.")
-
-                with st.expander("Edit Selected User / Reset Password", expanded=False):
-                    with st.form("edit_attendance_user"):
-                        edit_name = st.text_input("Name", value=str(selected_row["name"]))
-                        edit_mobile = st.text_input("Mobile number", value=str(selected_row.get("mobile") or ""))
-                        edit_role = st.selectbox(
-                            "User type",
-                            options=["observer", "outsource"],
-                            index=0 if selected_row["role"] == "observer" else 1,
-                            format_func=_status_title,
-                        )
-                        edit_designation = st.text_input(
-                            "Designation / Work detail",
-                            value=str(selected_row.get("designation") or ""),
-                        )
-                        edit_joined_date = st.date_input(
-                            "Joined date",
-                            value=_date_input_default(selected_row.get("joined_date")),
-                            format="DD-MM-YYYY",
-                            key="edit_attendance_joined_date",
-                        )
-                        if selected_row["role"] == "observer":
-                            edit_password = st.text_input(
-                                "New observer password",
-                                type="password",
-                                help="Leave blank to keep the current password.",
-                            )
-                        else:
-                            edit_password = ""
-                            st.caption("Outsource users do not need a password; mobile number is used.")
-                        edit_details = st.text_area("Other details", value=str(selected_row.get("details") or ""))
-                        update_submitted = st.form_submit_button(
-                            "Update User",
-                            type="primary",
-                            use_container_width=True,
-                        )
-                        if update_submitted:
-                            try:
-                                service.update_user_profile(
-                                    user_id=int(selected_row["id"]),
-                                    name=edit_name,
-                                    mobile=edit_mobile,
-                                    role=edit_role,
-                                    designation=edit_designation,
-                                    joined_date=edit_joined_date,
-                                    details=edit_details,
-                                    password=edit_password,
-                                    actor_name=auth["name"],
-                                )
-                                st.success("User updated.")
-                                st.rerun()
-                            except ValueError as exc:
-                                st.error(str(exc))
-
-    with tabs[2]:
-        st.subheader("Attendance Register")
-        month = st.selectbox(
-            "Attendance month",
-            options=_month_options(service),
-            format_func=_month_label,
-            key="admin_att_month",
-        )
-        matrix = service.build_monthly_attendance_df(month)
-        st.caption(
-            "Legend: M 07:00-08:59, G 09:00-12:59, E 13:00-16:59, "
-            f"N 19:00-21:59, O other, P pending. Attendance % is calculated from "
-            f"{ATTENDANCE_PERCENT_BASE_DAYS} working days. Rejected entries are excluded."
-        )
-        if not matrix.empty:
-            avg_attendance = float(matrix["Attendance %"].mean())
-            top_attendance = float(matrix["Attendance %"].max())
-            fully_present = int((matrix["Attendance %"] >= 100).sum())
-            att_col1, att_col2, att_col3 = st.columns(3)
-            att_col1.metric("Average Attendance", f"{avg_attendance:.2f}%")
-            att_col2.metric("Highest Attendance", f"{top_attendance:.2f}%")
-            att_col3.metric("100% Attendance", fully_present)
-        st.dataframe(
-            matrix,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Attendance %": st.column_config.ProgressColumn(
-                    "Attendance %",
-                    format="%.2f%%",
-                    min_value=0,
-                    max_value=100,
-                )
-            },
-        )
-
-        st.markdown("---")
-        st.subheader("Raw Login Data")
-        st.dataframe(service.build_raw_attendance_df(month), use_container_width=True, hide_index=True)
-
-    with tabs[3]:
-        st.subheader("Excel Export")
-        month = st.selectbox(
-            "Export month",
-            options=_month_options(service),
-            format_func=_month_label,
-            key="admin_export_month",
-        )
-        excel_bytes = service.export_attendance_workbook(month)
-        st.download_button(
-            "Download Attendance Excel",
-            data=excel_bytes,
-            file_name=f"outsource_attendance_{month}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-
-    with tabs[4]:
-        st.subheader("Audit Trail")
-        st.dataframe(service.get_audit_log(limit=1000), use_container_width=True, hide_index=True)
+    if section == "Approvals":
+        _render_admin_approvals(service, auth)
+    elif section == "Users":
+        _render_admin_users(service, auth)
+    elif section == "Attendance":
+        _render_admin_attendance(service)
+    elif section == "Export":
+        _render_admin_export(service)
+    else:
+        _render_admin_audit(service)
 
 
 def render_attendance_observer_page() -> None:
@@ -2223,8 +2457,14 @@ def render_attendance_observer_page() -> None:
         key="observer_month",
     )
 
-    tabs = st.tabs(["Pending", "All Entries"])
-    with tabs[0]:
+    view = st.radio(
+        "Observer view",
+        options=OBSERVER_VIEWS,
+        horizontal=True,
+        key="observer_view",
+    )
+
+    if view == "Pending":
         pending_entries = service.list_entries(month=month, status_filter="pending")
         st.dataframe(
             _display_entries(pending_entries) if not pending_entries.empty else _empty_entries_display(),
@@ -2239,8 +2479,7 @@ def render_attendance_observer_page() -> None:
             actor_name=auth["name"],
             key_prefix="observer_pending",
         )
-
-    with tabs[1]:
+    else:
         entries = service.list_entries(month=month)
         st.dataframe(
             _display_entries(entries) if not entries.empty else _empty_entries_display(),
@@ -2290,7 +2529,7 @@ def render_outsource_login_page() -> None:
 
     st.markdown("---")
     st.subheader("My Recent Entries")
-    recent = service.list_entries(outsource_user_id=int(auth["id"])).head(10)
+    recent = service.list_entries(outsource_user_id=int(auth["id"]), limit=10)
     st.dataframe(
         _display_entries(recent) if not recent.empty else _empty_entries_display(),
         use_container_width=True,

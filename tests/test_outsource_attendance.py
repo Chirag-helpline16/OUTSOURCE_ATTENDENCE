@@ -149,6 +149,57 @@ def test_pending_filter_only_includes_entries_with_no_decision(tmp_path):
     assert pending["id"].tolist() == [pending_entry]
 
 
+def test_summary_metrics_count_effective_status_without_loading_entries(tmp_path):
+    service = AttendanceService(tmp_path / "attendance.sqlite")
+    service.add_user("Observer Summary", "observer", "9876543230")
+    first_user = service.add_user("Summary One", "outsource", "9876543231")
+    second_user = service.add_user("Summary Two", "outsource", "9876543232")
+
+    accepted_entry = service.submit_login(
+        first_user,
+        "pc-a",
+        login_at=datetime(2026, 5, 9, 9, 30, tzinfo=IST),
+    )
+    rejected_entry = service.submit_login(
+        first_user,
+        "pc-b",
+        login_at=datetime(2026, 5, 10, 9, 30, tzinfo=IST),
+    )
+    service.submit_login(
+        second_user,
+        "pc-c",
+        login_at=datetime(2026, 5, 11, 9, 30, tzinfo=IST),
+    )
+
+    service.decide_entry(accepted_entry, "accepted", "observer", "Observer Summary")
+    service.decide_entry(rejected_entry, "accepted", "observer", "Observer Summary")
+    service.decide_entry(rejected_entry, "rejected", "admin", "Admin")
+
+    metrics = service.get_summary_metrics()
+
+    assert metrics["accepted"] == 1
+    assert metrics["rejected"] == 1
+    assert metrics["pending"] == 1
+    assert metrics["observer_users"] == 1
+    assert metrics["outsource_users"] == 2
+
+
+def test_list_entries_limit_returns_newest_entries(tmp_path):
+    service = AttendanceService(tmp_path / "attendance.sqlite")
+    outsource_id = service.add_user("Limited User", "outsource", "9876543233")
+
+    for day in range(1, 5):
+        service.submit_login(
+            outsource_id,
+            f"pc-{day}",
+            login_at=datetime(2026, 5, day, 9, 30, tzinfo=IST),
+        )
+
+    entries = service.list_entries(outsource_user_id=outsource_id, limit=2)
+
+    assert entries["pc_name"].tolist() == ["PC-4", "PC-3"]
+
+
 def test_login_ip_address_is_stored_and_exported(tmp_path):
     service = AttendanceService(tmp_path / "attendance.sqlite")
     outsource_id = service.add_user("IP Audit User", "outsource", "9876543219")
