@@ -87,6 +87,24 @@ def _clean_text(value: str) -> str:
     return " ".join(str(value or "").strip().split())
 
 
+def _clean_gender(value: Any) -> str:
+    text = _clean_text(value).upper()
+    if text in {"F", "FEMALE"}:
+        return "Female"
+    if text in {"M", "MALE"}:
+        return "Male"
+    return _clean_text(value)
+
+
+def _clean_department(value: Any) -> str:
+    text = _clean_text(value).upper()
+    if text in {"N", "NOTICE"}:
+        return "Notice"
+    if text in {"C", "CALLING"}:
+        return "Calling"
+    return _clean_text(value)
+
+
 def _clean_mobile(value: str) -> str:
     return "".join(ch for ch in str(value or "") if ch.isdigit())
 
@@ -114,6 +132,16 @@ def _clean_joined_date(value: Any) -> str:
         except ValueError:
             continue
     return text
+
+
+def _clean_required_iso_date(value: Any, label: str = "Date") -> str:
+    clean_date = _clean_joined_date(value)
+    if not clean_date:
+        raise ValueError(f"{label} is required.")
+    try:
+        return datetime.strptime(clean_date, "%Y-%m-%d").date().isoformat()
+    except ValueError as exc:
+        raise ValueError(f"{label} must be a valid date.") from exc
 
 
 def _clean_ip_address(value: Any) -> str:
@@ -287,7 +315,10 @@ class AttendanceService:
                     role TEXT NOT NULL CHECK (role IN ('observer', 'outsource')),
                     agency TEXT,
                     designation TEXT,
+                    gender TEXT,
+                    department TEXT,
                     joined_date TEXT,
+                    study TEXT,
                     details TEXT,
                     active INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
@@ -342,6 +373,25 @@ class AttendanceService:
                 CREATE INDEX IF NOT EXISTS idx_att_entries_status_date
                 ON login_entries(admin_status, observer_status, login_date);
 
+                CREATE TABLE IF NOT EXISTS cl_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    outsource_user_id INTEGER NOT NULL,
+                    outsource_name TEXT NOT NULL,
+                    cl_date TEXT NOT NULL,
+                    remarks TEXT,
+                    created_at TEXT NOT NULL,
+                    created_by TEXT,
+                    updated_at TEXT NOT NULL,
+                    updated_by TEXT,
+                    FOREIGN KEY(outsource_user_id) REFERENCES users(id)
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_att_cl_user_date
+                ON cl_entries(outsource_user_id, cl_date);
+
+                CREATE INDEX IF NOT EXISTS idx_att_cl_date
+                ON cl_entries(cl_date);
+
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     event_type TEXT NOT NULL,
@@ -371,7 +421,10 @@ class AttendanceService:
             "password_hash": "ALTER TABLE users ADD COLUMN password_hash TEXT",
             "agency": "ALTER TABLE users ADD COLUMN agency TEXT",
             "designation": "ALTER TABLE users ADD COLUMN designation TEXT",
+            "gender": "ALTER TABLE users ADD COLUMN gender TEXT",
+            "department": "ALTER TABLE users ADD COLUMN department TEXT",
             "joined_date": "ALTER TABLE users ADD COLUMN joined_date TEXT",
+            "study": "ALTER TABLE users ADD COLUMN study TEXT",
             "details": "ALTER TABLE users ADD COLUMN details TEXT",
         }
         for column, statement in migrations.items():
@@ -393,6 +446,17 @@ class AttendanceService:
         }
         if "ip_address" not in existing_columns:
             conn.execute("ALTER TABLE login_entries ADD COLUMN ip_address TEXT")
+
+    def reset_all_data(self) -> None:
+        """Remove all attendance data and reset local integer IDs."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM audit_log")
+            conn.execute("DELETE FROM cl_entries")
+            conn.execute("DELETE FROM login_entries")
+            conn.execute("DELETE FROM users")
+            conn.execute(
+                "DELETE FROM sqlite_sequence WHERE name IN ('audit_log', 'cl_entries', 'login_entries', 'users')"
+            )
 
     def _log_event(
         self,
@@ -423,6 +487,9 @@ class AttendanceService:
         designation: str = "",
         joined_date: Any = "",
         details: str = "",
+        gender: str = "",
+        department: str = "",
+        study: str = "",
         created_by: str = "Admin",
     ) -> int:
         """Add an observer or outsource user."""
@@ -442,7 +509,10 @@ class AttendanceService:
         if role == "observer":
             password_hash = hash_password(str(password or "").strip() or clean_mobile)
         timestamp = _timestamp()
+        clean_department = _clean_department(department or designation)
+        clean_gender = _clean_gender(gender)
         clean_joined_date = _clean_joined_date(joined_date)
+        clean_study = _clean_text(study)
 
         with self._connect() as conn:
             try:
@@ -450,9 +520,10 @@ class AttendanceService:
                     """
                     INSERT INTO users (
                         name, normalized_name, mobile, normalized_mobile, password_hash,
-                        role, agency, designation, joined_date, details, active, created_at, created_by, updated_at
+                        role, agency, designation, gender, department, joined_date, study,
+                        details, active, created_at, created_by, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                     """,
                     (
                         clean_name,
@@ -462,8 +533,11 @@ class AttendanceService:
                         password_hash,
                         role,
                         "",
-                        _clean_text(designation),
+                        _clean_text(designation) or clean_department,
+                        clean_gender,
+                        clean_department,
                         clean_joined_date,
+                        clean_study,
                         str(details or "").strip(),
                         timestamp,
                         created_by,
@@ -499,7 +573,10 @@ class AttendanceService:
                             password_hash = ?,
                             agency = ?,
                             designation = ?,
+                            gender = ?,
+                            department = ?,
                             joined_date = ?,
+                            study = ?,
                             details = ?,
                             updated_at = ?
                         WHERE id = ?
@@ -510,8 +587,11 @@ class AttendanceService:
                             clean_mobile,
                             password_hash,
                             "",
-                            _clean_text(designation),
+                            _clean_text(designation) or clean_department,
+                            clean_gender,
+                            clean_department,
                             clean_joined_date,
+                            clean_study,
                             str(details or "").strip(),
                             timestamp,
                             row["id"],
@@ -539,6 +619,9 @@ class AttendanceService:
         designation: str = "",
         joined_date: Any = "",
         details: str = "",
+        gender: str = "",
+        department: str = "",
+        study: str = "",
         password: str = "",
         actor_name: str = "Admin",
     ) -> None:
@@ -553,6 +636,7 @@ class AttendanceService:
         if not clean_mobile:
             raise ValueError("Mobile number is required.")
 
+        clean_department = _clean_department(department or designation)
         set_clauses = [
             "name = ?",
             "normalized_name = ?",
@@ -560,7 +644,10 @@ class AttendanceService:
             "normalized_mobile = ?",
             "role = ?",
             "designation = ?",
+            "gender = ?",
+            "department = ?",
             "joined_date = ?",
+            "study = ?",
             "details = ?",
             "updated_at = ?",
         ]
@@ -570,8 +657,11 @@ class AttendanceService:
             clean_mobile,
             clean_mobile,
             role,
-            _clean_text(designation),
+            _clean_text(designation) or clean_department,
+            _clean_gender(gender),
+            clean_department,
             _clean_joined_date(joined_date),
+            _clean_text(study),
             str(details or "").strip(),
             _timestamp(),
         ]
@@ -645,7 +735,10 @@ class AttendanceService:
                 mobile,
                 role,
                 designation,
+                gender,
+                department,
                 joined_date,
+                study,
                 details,
                 active,
                 CASE WHEN password_hash IS NULL OR password_hash = '' THEN 0 ELSE 1 END AS has_password,
@@ -673,7 +766,7 @@ class AttendanceService:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT id, name, mobile, role, designation, password_hash
+                SELECT id, name, mobile, role, designation, department, password_hash
                 FROM users
                 WHERE id = ? AND role = ? AND active = 1
                 """,
@@ -695,7 +788,7 @@ class AttendanceService:
                 "name": row["name"],
                 "mobile": row["mobile"] or "",
                 "role": row["role"],
-                "designation": row["designation"] or "",
+                "designation": row["designation"] or row["department"] or "",
             }
 
     def authenticate_outsource_user(
@@ -708,7 +801,7 @@ class AttendanceService:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT id, name, mobile, role, designation
+                SELECT id, name, mobile, role, designation, department
                 FROM users
                 WHERE id = ?
                     AND role = 'outsource'
@@ -733,7 +826,7 @@ class AttendanceService:
                 "name": row["name"],
                 "mobile": row["mobile"] or "",
                 "role": row["role"],
-                "designation": row["designation"] or "",
+                "designation": row["designation"] or row["department"] or "",
             }
 
     def submit_login(
@@ -858,6 +951,194 @@ class AttendanceService:
                 details=remarks or None,
             )
 
+    def add_cl_entry(
+        self,
+        outsource_user_id: int,
+        cl_date: Any,
+        remarks: str = "",
+        actor_name: str = "Admin",
+    ) -> int:
+        """Add a manually approved CL day for an outsource user."""
+        clean_date = _clean_required_iso_date(cl_date, "CL date")
+        actor_name = _clean_name(actor_name) or "Admin"
+        clean_remarks = str(remarks or "").strip()
+        timestamp = _timestamp()
+
+        with self._connect() as conn:
+            user = conn.execute(
+                """
+                SELECT id, name FROM users
+                WHERE id = ? AND role = 'outsource' AND active = 1
+                """,
+                (outsource_user_id,),
+            ).fetchone()
+            if user is None:
+                raise ValueError("Select an active outsource user.")
+
+            try:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO cl_entries (
+                        outsource_user_id, outsource_name, cl_date, remarks,
+                        created_at, created_by, updated_at, updated_by
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(user["id"]),
+                        user["name"],
+                        clean_date,
+                        clean_remarks,
+                        timestamp,
+                        actor_name,
+                        timestamp,
+                        actor_name,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("CL already exists for this user and date.") from exc
+
+            cl_id = int(cursor.lastrowid)
+            self._log_event(
+                conn,
+                "cl_created",
+                actor_role="admin",
+                actor_name=actor_name,
+                user_id=int(user["id"]),
+                details=f"CL added for {user['name']} on {clean_date}",
+            )
+            return cl_id
+
+    def update_cl_entry(
+        self,
+        cl_id: int,
+        outsource_user_id: int,
+        cl_date: Any,
+        remarks: str = "",
+        actor_name: str = "Admin",
+    ) -> None:
+        """Update a manually approved CL day."""
+        clean_date = _clean_required_iso_date(cl_date, "CL date")
+        actor_name = _clean_name(actor_name) or "Admin"
+        clean_remarks = str(remarks or "").strip()
+        timestamp = _timestamp()
+
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM cl_entries WHERE id = ?",
+                (cl_id,),
+            ).fetchone()
+            if existing is None:
+                raise ValueError("CL entry not found.")
+
+            user = conn.execute(
+                """
+                SELECT id, name FROM users
+                WHERE id = ? AND role = 'outsource' AND active = 1
+                """,
+                (outsource_user_id,),
+            ).fetchone()
+            if user is None:
+                raise ValueError("Select an active outsource user.")
+
+            try:
+                conn.execute(
+                    """
+                    UPDATE cl_entries
+                    SET outsource_user_id = ?,
+                        outsource_name = ?,
+                        cl_date = ?,
+                        remarks = ?,
+                        updated_at = ?,
+                        updated_by = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        int(user["id"]),
+                        user["name"],
+                        clean_date,
+                        clean_remarks,
+                        timestamp,
+                        actor_name,
+                        int(cl_id),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("CL already exists for this user and date.") from exc
+
+            self._log_event(
+                conn,
+                "cl_updated",
+                actor_role="admin",
+                actor_name=actor_name,
+                user_id=int(user["id"]),
+                details=f"CL updated for {user['name']} on {clean_date}",
+            )
+
+    def delete_cl_entry(self, cl_id: int, actor_name: str = "Admin") -> None:
+        """Delete a manually approved CL day."""
+        actor_name = _clean_name(actor_name) or "Admin"
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, outsource_user_id, outsource_name, cl_date
+                FROM cl_entries
+                WHERE id = ?
+                """,
+                (cl_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("CL entry not found.")
+
+            conn.execute("DELETE FROM cl_entries WHERE id = ?", (cl_id,))
+            self._log_event(
+                conn,
+                "cl_deleted",
+                actor_role="admin",
+                actor_name=actor_name,
+                user_id=int(row["outsource_user_id"]),
+                details=f"CL deleted for {row['outsource_name']} on {row['cl_date']}",
+            )
+
+    def list_cl_entries(
+        self,
+        month: str | None = None,
+        outsource_user_id: int | None = None,
+    ) -> pd.DataFrame:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if month:
+            start_date, end_date = _month_bounds(month)
+            clauses.append("c.cl_date >= ? AND c.cl_date < ?")
+            params.extend([start_date, end_date])
+        if outsource_user_id:
+            clauses.append("c.outsource_user_id = ?")
+            params.append(outsource_user_id)
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        query = f"""
+            SELECT
+                c.id,
+                c.outsource_user_id,
+                c.outsource_name,
+                COALESCE(u.active, 0) AS outsource_active,
+                c.cl_date,
+                c.remarks,
+                c.created_at,
+                c.created_by,
+                c.updated_at,
+                c.updated_by
+            FROM cl_entries c
+            LEFT JOIN users u ON u.id = c.outsource_user_id
+            {where}
+            ORDER BY c.cl_date DESC, c.id DESC
+        """
+        with self._connect() as conn:
+            df = pd.read_sql_query(query, conn, params=params)
+        if not df.empty:
+            df["outsource_active"] = df["outsource_active"].astype(bool)
+        return df.reset_index(drop=True)
+
     def list_entries(
         self,
         month: str | None = None,
@@ -935,6 +1216,9 @@ class AttendanceService:
                 """
                 SELECT DISTINCT substr(login_date, 1, 7) AS month
                 FROM login_entries
+                UNION
+                SELECT DISTINCT substr(cl_date, 1, 7) AS month
+                FROM cl_entries
                 ORDER BY month DESC
                 """
             ).fetchall()
@@ -1063,16 +1347,20 @@ class AttendanceService:
         ]
 
         entries = self.list_entries(month=month)
+        cl_entries = self.list_cl_entries(month=month)
         users = self.list_users(role="outsource")
         names: list[str] = []
         if not users.empty:
             names.extend(users["name"].tolist())
         if not entries.empty:
             names.extend(entries["outsource_name"].dropna().tolist())
+        if not cl_entries.empty:
+            names.extend(cl_entries["outsource_name"].dropna().tolist())
         unique_names = sorted(dict.fromkeys(names), key=str.casefold)
 
         accepted_dates: set[tuple[str, str]] = set()
         pending_dates: set[tuple[str, str]] = set()
+        cl_dates: set[tuple[str, str]] = set()
         accepted_shifts: dict[tuple[str, str], set[str]] = {}
         if not entries.empty:
             accepted_entries = entries[entries["effective_status"] == "accepted"]
@@ -1094,6 +1382,13 @@ class AttendanceService:
                 if name and login_date:
                     pending_dates.add((name, login_date))
 
+        if not cl_entries.empty:
+            for row in cl_entries.itertuples(index=False):
+                name = str(getattr(row, "outsource_name") or "")
+                cl_date = str(getattr(row, "cl_date") or "")
+                if name and cl_date:
+                    cl_dates.add((name, cl_date))
+
         rows: list[dict[str, Any]] = []
         for name in unique_names:
             row: dict[str, Any] = {"Name": name}
@@ -1109,6 +1404,9 @@ class AttendanceService:
                         key=lambda code: SHIFT_ORDER.get(code, 99),
                     )
                     marker = "/".join(shifts)
+                    present_days += 1
+                elif key in cl_dates:
+                    marker = "CL"
                     present_days += 1
                 elif key in pending_dates:
                     marker = "P"
@@ -1128,10 +1426,12 @@ class AttendanceService:
         parsed = datetime.strptime(month, "%Y-%m")
         days_in_month = calendar.monthrange(parsed.year, parsed.month)[1]
         entries = self.list_entries(month=month)
+        cl_entries = self.list_cl_entries(month=month)
         rows: list[dict[str, Any]] = []
         total_by_date: dict[str, int] = {}
         status_by_date: dict[tuple[str, str], int] = {}
         shift_by_date: dict[tuple[str, str], int] = {}
+        cl_by_date: dict[str, int] = {}
 
         if not entries.empty:
             total_by_date = entries.groupby("login_date").size().astype(int).to_dict()
@@ -1149,6 +1449,8 @@ class AttendanceService:
                     .astype(int)
                     .to_dict()
                 )
+        if not cl_entries.empty:
+            cl_by_date = cl_entries.groupby("cl_date").size().astype(int).to_dict()
 
         for day in range(1, days_in_month + 1):
             current = date(parsed.year, parsed.month, day)
@@ -1161,6 +1463,7 @@ class AttendanceService:
                     "Accepted": status_by_date.get((current_key, "accepted"), 0),
                     "Rejected": status_by_date.get((current_key, "rejected"), 0),
                     "Pending": status_by_date.get((current_key, "pending"), 0),
+                    "CL": cl_by_date.get(current_key, 0),
                     "Morning": shift_by_date.get((current_key, "M"), 0),
                     "General": shift_by_date.get((current_key, "G"), 0),
                     "Evening": shift_by_date.get((current_key, "E"), 0),
@@ -1198,6 +1501,7 @@ class AttendanceService:
             "Login Register": self.build_raw_attendance_df(month),
             "Monthly Attendance": self.build_monthly_attendance_df(month),
             "Daily Summary": self.build_daily_summary_df(month),
+            "CL Register": self.list_cl_entries(month=month),
             "User Master": self.list_users(),
             "Audit Log": self.get_audit_log(limit=5000),
         }
@@ -1226,6 +1530,7 @@ class AttendanceService:
             "pending": PatternFill("solid", fgColor="FFF2CC"),
             "P": PatternFill("solid", fgColor="FFF2CC"),
             "R": PatternFill("solid", fgColor="F4CCCC"),
+            "CL": PatternFill("solid", fgColor="D9EAD3"),
         }
         shift_fill = {
             "M": PatternFill("solid", fgColor="D9EAD3"),
@@ -1301,6 +1606,7 @@ class MongoAttendanceService(AttendanceService):
         self.db = self.client[self.database_name]
         self.users = self.db["attendance_users"]
         self.entries = self.db["attendance_login_entries"]
+        self.cl_entries = self.db["attendance_cl_entries"]
         self.audit = self.db["attendance_audit_log"]
         self.counters = self.db["attendance_counters"]
         self.storage_label = f"MongoDB database: {self.database_name}"
@@ -1345,7 +1651,20 @@ class MongoAttendanceService(AttendanceService):
             [("admin_status", ASCENDING), ("observer_status", ASCENDING), ("login_date", ASCENDING)],
             name="idx_att_entries_status_date",
         )
+        self.cl_entries.create_index(
+            [("outsource_user_id", ASCENDING), ("cl_date", ASCENDING)],
+            unique=True,
+            name="idx_att_cl_user_date",
+        )
+        self.cl_entries.create_index([("cl_date", ASCENDING)], name="idx_att_cl_date")
         self.audit.create_index([("created_at", DESCENDING)], name="idx_att_audit_created_at")
+
+    def reset_all_data(self) -> None:
+        self.audit.delete_many({})
+        self.cl_entries.delete_many({})
+        self.entries.delete_many({})
+        self.users.delete_many({})
+        self.counters.delete_many({})
 
     def _next_id(self, name: str) -> int:
         row = self.counters.find_one_and_update(
@@ -1395,6 +1714,9 @@ class MongoAttendanceService(AttendanceService):
         designation: str = "",
         joined_date: Any = "",
         details: str = "",
+        gender: str = "",
+        department: str = "",
+        study: str = "",
         created_by: str = "Admin",
     ) -> int:
         role = str(role or "").strip().lower()
@@ -1409,6 +1731,7 @@ class MongoAttendanceService(AttendanceService):
 
         timestamp = _timestamp()
         password_hash = hash_password(str(password or "").strip() or clean_mobile) if role == "observer" else None
+        clean_department = _clean_department(department or designation)
         doc = {
             "id": self._next_id("users"),
             "name": clean_name,
@@ -1417,8 +1740,11 @@ class MongoAttendanceService(AttendanceService):
             "normalized_mobile": clean_mobile,
             "password_hash": password_hash,
             "role": role,
-            "designation": _clean_text(designation),
+            "designation": _clean_text(designation) or clean_department,
+            "gender": _clean_gender(gender),
+            "department": clean_department,
             "joined_date": _clean_joined_date(joined_date),
+            "study": _clean_text(study),
             "details": str(details or "").strip(),
             "active": True,
             "created_at": timestamp,
@@ -1449,6 +1775,9 @@ class MongoAttendanceService(AttendanceService):
         designation: str = "",
         joined_date: Any = "",
         details: str = "",
+        gender: str = "",
+        department: str = "",
+        study: str = "",
         password: str = "",
         actor_name: str = "Admin",
     ) -> None:
@@ -1462,14 +1791,18 @@ class MongoAttendanceService(AttendanceService):
         if not clean_mobile:
             raise ValueError("Mobile number is required.")
 
+        clean_department = _clean_department(department or designation)
         update_doc: dict[str, Any] = {
             "name": clean_name,
             "normalized_name": _normalize_name(clean_name),
             "mobile": clean_mobile,
             "normalized_mobile": clean_mobile,
             "role": role,
-            "designation": _clean_text(designation),
+            "designation": _clean_text(designation) or clean_department,
+            "gender": _clean_gender(gender),
+            "department": clean_department,
             "joined_date": _clean_joined_date(joined_date),
+            "study": _clean_text(study),
             "details": str(details or "").strip(),
             "updated_at": _timestamp(),
         }
@@ -1520,7 +1853,8 @@ class MongoAttendanceService(AttendanceService):
         docs = list(self.users.find(query).sort([("role", ASCENDING), ("active", DESCENDING), ("name", ASCENDING)]))
         df = self._docs_to_df(docs)
         columns = [
-            "id", "name", "mobile", "role", "designation", "joined_date", "details",
+            "id", "name", "mobile", "role", "designation", "gender", "department",
+            "joined_date", "study", "details",
             "active", "has_password", "created_at", "created_by", "updated_at",
         ]
         if df.empty:
@@ -1546,7 +1880,7 @@ class MongoAttendanceService(AttendanceService):
             "name": row["name"],
             "mobile": row.get("mobile", ""),
             "role": row["role"],
-            "designation": row.get("designation", ""),
+            "designation": row.get("designation") or row.get("department", ""),
         }
 
     def authenticate_outsource_user(self, user_id: int, mobile: str) -> dict[str, Any] | None:
@@ -1573,7 +1907,7 @@ class MongoAttendanceService(AttendanceService):
             "name": row["name"],
             "mobile": row.get("mobile", ""),
             "role": row["role"],
-            "designation": row.get("designation", ""),
+            "designation": row.get("designation") or row.get("department", ""),
         }
 
     def submit_login(
@@ -1675,6 +2009,152 @@ class MongoAttendanceService(AttendanceService):
             details=remarks or None,
         )
 
+    def add_cl_entry(
+        self,
+        outsource_user_id: int,
+        cl_date: Any,
+        remarks: str = "",
+        actor_name: str = "Admin",
+    ) -> int:
+        clean_date = _clean_required_iso_date(cl_date, "CL date")
+        actor_name = _clean_name(actor_name) or "Admin"
+        clean_remarks = str(remarks or "").strip()
+        user = self.users.find_one(
+            {"id": int(outsource_user_id), "role": "outsource", "active": True}
+        )
+        if user is None:
+            raise ValueError("Select an active outsource user.")
+
+        timestamp = _timestamp()
+        doc = {
+            "id": self._next_id("cl_entries"),
+            "outsource_user_id": int(user["id"]),
+            "outsource_name": user["name"],
+            "cl_date": clean_date,
+            "remarks": clean_remarks,
+            "created_at": timestamp,
+            "created_by": actor_name,
+            "updated_at": timestamp,
+            "updated_by": actor_name,
+        }
+        try:
+            self.cl_entries.insert_one(doc)
+        except DuplicateKeyError as exc:
+            raise ValueError("CL already exists for this user and date.") from exc
+
+        self._log_event(
+            None,
+            "cl_created",
+            actor_role="admin",
+            actor_name=actor_name,
+            user_id=int(user["id"]),
+            details=f"CL added for {user['name']} on {clean_date}",
+        )
+        return int(doc["id"])
+
+    def update_cl_entry(
+        self,
+        cl_id: int,
+        outsource_user_id: int,
+        cl_date: Any,
+        remarks: str = "",
+        actor_name: str = "Admin",
+    ) -> None:
+        clean_date = _clean_required_iso_date(cl_date, "CL date")
+        actor_name = _clean_name(actor_name) or "Admin"
+        clean_remarks = str(remarks or "").strip()
+        if self.cl_entries.find_one({"id": int(cl_id)}) is None:
+            raise ValueError("CL entry not found.")
+
+        user = self.users.find_one(
+            {"id": int(outsource_user_id), "role": "outsource", "active": True}
+        )
+        if user is None:
+            raise ValueError("Select an active outsource user.")
+
+        try:
+            self.cl_entries.update_one(
+                {"id": int(cl_id)},
+                {
+                    "$set": {
+                        "outsource_user_id": int(user["id"]),
+                        "outsource_name": user["name"],
+                        "cl_date": clean_date,
+                        "remarks": clean_remarks,
+                        "updated_at": _timestamp(),
+                        "updated_by": actor_name,
+                    }
+                },
+            )
+        except DuplicateKeyError as exc:
+            raise ValueError("CL already exists for this user and date.") from exc
+
+        self._log_event(
+            None,
+            "cl_updated",
+            actor_role="admin",
+            actor_name=actor_name,
+            user_id=int(user["id"]),
+            details=f"CL updated for {user['name']} on {clean_date}",
+        )
+
+    def delete_cl_entry(self, cl_id: int, actor_name: str = "Admin") -> None:
+        actor_name = _clean_name(actor_name) or "Admin"
+        row = self.cl_entries.find_one({"id": int(cl_id)})
+        if row is None:
+            raise ValueError("CL entry not found.")
+
+        self.cl_entries.delete_one({"id": int(cl_id)})
+        self._log_event(
+            None,
+            "cl_deleted",
+            actor_role="admin",
+            actor_name=actor_name,
+            user_id=int(row["outsource_user_id"]),
+            details=f"CL deleted for {row['outsource_name']} on {row['cl_date']}",
+        )
+
+    def list_cl_entries(
+        self,
+        month: str | None = None,
+        outsource_user_id: int | None = None,
+    ) -> pd.DataFrame:
+        query: dict[str, Any] = {}
+        if month:
+            start_date, end_date = _month_bounds(month)
+            query["cl_date"] = {"$gte": start_date, "$lt": end_date}
+        if outsource_user_id:
+            query["outsource_user_id"] = int(outsource_user_id)
+
+        docs = list(self.cl_entries.find(query).sort([("cl_date", DESCENDING), ("id", DESCENDING)]))
+        df = self._docs_to_df(docs)
+        columns = [
+            "id",
+            "outsource_user_id",
+            "outsource_name",
+            "outsource_active",
+            "cl_date",
+            "remarks",
+            "created_at",
+            "created_by",
+            "updated_at",
+            "updated_by",
+        ]
+        if df.empty:
+            return pd.DataFrame(columns=columns)
+
+        active_by_id = {
+            int(row["id"]): bool(row.get("active"))
+            for row in self.users.find(
+                {"id": {"$in": [int(value) for value in df["outsource_user_id"].tolist()]}},
+                {"_id": 0, "id": 1, "active": 1},
+            )
+        }
+        df["outsource_active"] = [
+            active_by_id.get(int(value), False) for value in df["outsource_user_id"]
+        ]
+        return df.reindex(columns=columns).reset_index(drop=True)
+
     def list_entries(
         self,
         month: str | None = None,
@@ -1757,6 +2237,7 @@ class MongoAttendanceService(AttendanceService):
 
     def get_available_months(self) -> list[str]:
         dates = [value for value in self.entries.distinct("login_date") if value]
+        dates.extend(value for value in self.cl_entries.distinct("cl_date") if value)
         return sorted({str(value)[:7] for value in dates}, reverse=True)
 
     def get_audit_log(self, limit: int = 500) -> pd.DataFrame:
@@ -2115,7 +2596,7 @@ def _render_decision_form(
             save_decision("rejected")
 
 
-ADMIN_SECTIONS = ["Approvals", "Users", "Attendance", "Export", "Audit"]
+ADMIN_SECTIONS = ["Approvals", "Users", "Attendance", "Export", "CL", "Audit"]
 OBSERVER_VIEWS = ["Pending", "All Entries"]
 
 
@@ -2192,13 +2673,10 @@ def _render_admin_users(service: AttendanceService, auth: dict[str, Any]) -> Non
         with st.form("create_attendance_user"):
             name = st.text_input("Name")
             mobile = st.text_input("Mobile number")
-            designation = st.text_input("Designation / Work detail")
-            joined_date = st.date_input(
-                "Joined date",
-                value=now_ist().date(),
-                format="DD-MM-YYYY",
-                key="create_attendance_joined_date",
-            )
+            gender = st.selectbox("Gender", options=["", "Female", "Male"])
+            department = st.selectbox("Department", options=["", "Notice", "Calling"])
+            joined_date = st.text_input("Joining date", placeholder="DD-MM-YYYY")
+            study = st.text_input("Study")
             if role == "observer":
                 password = st.text_input(
                     "Observer password",
@@ -2217,8 +2695,11 @@ def _render_admin_users(service: AttendanceService, auth: dict[str, Any]) -> Non
                         role=role,
                         mobile=mobile,
                         password=password,
-                        designation=designation,
+                        designation=department,
                         joined_date=joined_date,
+                        gender=gender,
+                        department=department,
+                        study=study,
                         details=details,
                         created_by=auth["name"],
                     )
@@ -2240,7 +2721,10 @@ def _render_admin_users(service: AttendanceService, auth: dict[str, Any]) -> Non
                 "mobile": "Mobile",
                 "role": "Role",
                 "designation": "Designation",
+                "gender": "Gender",
+                "department": "Department",
                 "joined_date": "Joined Date",
+                "study": "Study",
                 "details": "Details",
                 "active": "Active",
                 "has_password": "Observer Password",
@@ -2249,6 +2733,11 @@ def _render_admin_users(service: AttendanceService, auth: dict[str, Any]) -> Non
                 "updated_at": "Updated At",
             }
         )
+        if "Department" in display_users.columns and "Designation" in display_users.columns:
+            display_users["Department"] = display_users["Department"].where(
+                display_users["Department"].fillna("").astype(str).str.strip().astype(bool),
+                display_users["Designation"],
+            )
         display_users["Role"] = display_users["Role"].map(_status_title)
         display_users["Observer Password"] = [
             "Not needed" if role == "Outsource" else ("Yes" if has_password else "No")
@@ -2257,6 +2746,25 @@ def _render_admin_users(service: AttendanceService, auth: dict[str, Any]) -> Non
                 display_users["Observer Password"],
             )
         ]
+        display_columns = [
+            "User ID",
+            "Name",
+            "Mobile",
+            "Role",
+            "Gender",
+            "Department",
+            "Joined Date",
+            "Study",
+            "Details",
+            "Active",
+            "Observer Password",
+            "Created At",
+            "Created By",
+            "Updated At",
+        ]
+        display_users = display_users.reindex(
+            columns=[column for column in display_columns if column in display_users.columns]
+        )
         st.dataframe(display_users, use_container_width=True, hide_index=True)
 
         user_options = {
@@ -2293,22 +2801,38 @@ def _render_admin_users(service: AttendanceService, auth: dict[str, Any]) -> Non
             with st.form("edit_attendance_user"):
                 edit_name = st.text_input("Name", value=str(selected_row["name"]))
                 edit_mobile = st.text_input("Mobile number", value=str(selected_row.get("mobile") or ""))
+                gender_options = ["", "Female", "Male"]
+                selected_gender = _clean_gender(selected_row.get("gender") or "")
+                edit_gender = st.selectbox(
+                    "Gender",
+                    options=gender_options,
+                    index=gender_options.index(selected_gender) if selected_gender in gender_options else 0,
+                )
+                department_options = ["", "Notice", "Calling"]
+                selected_department = _clean_department(
+                    selected_row.get("department") or selected_row.get("designation") or ""
+                )
+                edit_department = st.selectbox(
+                    "Department",
+                    options=department_options,
+                    index=(
+                        department_options.index(selected_department)
+                        if selected_department in department_options
+                        else 0
+                    ),
+                )
                 edit_role = st.selectbox(
                     "User type",
                     options=["observer", "outsource"],
                     index=0 if selected_row["role"] == "observer" else 1,
                     format_func=_status_title,
                 )
-                edit_designation = st.text_input(
-                    "Designation / Work detail",
-                    value=str(selected_row.get("designation") or ""),
+                edit_joined_date = st.text_input(
+                    "Joining date",
+                    value=str(selected_row.get("joined_date") or ""),
+                    placeholder="DD-MM-YYYY",
                 )
-                edit_joined_date = st.date_input(
-                    "Joined date",
-                    value=_date_input_default(selected_row.get("joined_date")),
-                    format="DD-MM-YYYY",
-                    key="edit_attendance_joined_date",
-                )
+                edit_study = st.text_input("Study", value=str(selected_row.get("study") or ""))
                 if selected_row["role"] == "observer":
                     edit_password = st.text_input(
                         "New observer password",
@@ -2331,8 +2855,11 @@ def _render_admin_users(service: AttendanceService, auth: dict[str, Any]) -> Non
                             name=edit_name,
                             mobile=edit_mobile,
                             role=edit_role,
-                            designation=edit_designation,
+                            designation=edit_department,
                             joined_date=edit_joined_date,
+                            gender=edit_gender,
+                            department=edit_department,
+                            study=edit_study,
                             details=edit_details,
                             password=edit_password,
                             actor_name=auth["name"],
@@ -2354,7 +2881,7 @@ def _render_admin_attendance(service: AttendanceService) -> None:
     matrix = service.build_monthly_attendance_df(month)
     st.caption(
         "Legend: M 07:00-08:59, G 09:00-12:59, E 13:00-16:59, "
-        f"N 19:00-21:59, O other, P pending. Attendance % is calculated from "
+        f"N 19:00-21:59, O other, P pending, CL casual leave. Attendance % is calculated from "
         f"{ATTENDANCE_PERCENT_BASE_DAYS} working days. Rejected entries are excluded."
     )
     if not matrix.empty:
@@ -2382,6 +2909,184 @@ def _render_admin_attendance(service: AttendanceService) -> None:
     st.markdown("---")
     st.subheader("Raw Login Data")
     st.dataframe(service.build_raw_attendance_df(month), use_container_width=True, hide_index=True)
+
+
+def _cl_display_df(cl_entries: pd.DataFrame) -> pd.DataFrame:
+    if cl_entries.empty:
+        return pd.DataFrame(
+            columns=[
+                "CL ID",
+                "Outsource Name",
+                "CL Date",
+                "Remarks",
+                "Active",
+                "Created At",
+                "Created By",
+                "Updated At",
+                "Updated By",
+            ]
+        )
+
+    display = cl_entries.rename(
+        columns={
+            "id": "CL ID",
+            "outsource_name": "Outsource Name",
+            "cl_date": "CL Date",
+            "remarks": "Remarks",
+            "outsource_active": "Active",
+            "created_at": "Created At",
+            "created_by": "Created By",
+            "updated_at": "Updated At",
+            "updated_by": "Updated By",
+        }
+    )
+    return display.reindex(
+        columns=[
+            "CL ID",
+            "Outsource Name",
+            "CL Date",
+            "Remarks",
+            "Active",
+            "Created At",
+            "Created By",
+            "Updated At",
+            "Updated By",
+        ]
+    )
+
+
+def _user_select_options(users: pd.DataFrame) -> dict[str, int]:
+    return {
+        f"{row['name']} | {row.get('mobile') or ''}".rstrip(" | "): int(row["id"])
+        for _, row in users.iterrows()
+    }
+
+
+def _render_admin_cl(service: AttendanceService, auth: dict[str, Any]) -> None:
+    st.subheader("CL Management")
+    st.caption("CL days are counted as present in the monthly attendance register.")
+
+    active_users = service.list_users(role="outsource", active=True)
+    create_col, list_col = st.columns([0.34, 0.66])
+    with create_col:
+        st.caption("Add CL")
+        if active_users.empty:
+            st.warning("Create an active outsource user before adding CL.")
+        else:
+            user_options = _user_select_options(active_users)
+            with st.form("create_cl_entry"):
+                selected_user = st.selectbox(
+                    "Outsource user",
+                    options=list(user_options.keys()),
+                    key="create_cl_user",
+                )
+                cl_date = st.date_input(
+                    "CL date",
+                    value=now_ist().date(),
+                    format="DD-MM-YYYY",
+                    key="create_cl_date",
+                )
+                remarks = st.text_area("Remarks", placeholder="Optional reason or note.")
+                submitted = st.form_submit_button("Add CL", type="primary", use_container_width=True)
+                if submitted:
+                    try:
+                        service.add_cl_entry(
+                            outsource_user_id=user_options[selected_user],
+                            cl_date=cl_date,
+                            remarks=remarks,
+                            actor_name=auth["name"],
+                        )
+                        st.success("CL saved.")
+                        st.rerun()
+                    except ValueError as exc:
+                        st.error(str(exc))
+
+    with list_col:
+        month = st.selectbox(
+            "CL month",
+            options=_month_options(service),
+            format_func=_month_label,
+            key="admin_cl_month",
+        )
+        cl_entries = service.list_cl_entries(month=month)
+        st.dataframe(_cl_display_df(cl_entries), use_container_width=True, hide_index=True)
+
+        if cl_entries.empty:
+            st.info("No CL entries for this month.")
+            return
+
+        entry_options = {
+            f"#{row['id']} | {row['outsource_name']} | {row['cl_date']}": int(row["id"])
+            for _, row in cl_entries.iterrows()
+        }
+        selected_entry = st.selectbox(
+            "Change existing CL",
+            options=list(entry_options.keys()),
+            key="admin_cl_entry",
+        )
+        selected_row = cl_entries[cl_entries["id"] == entry_options[selected_entry]].iloc[0]
+
+        if active_users.empty:
+            st.warning("No active outsource users available for CL updates.")
+            if st.button("Delete Selected CL", use_container_width=True, key="delete_cl_entry_btn"):
+                try:
+                    service.delete_cl_entry(int(selected_row["id"]), actor_name=auth["name"])
+                    st.success("CL deleted.")
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+            return
+
+        edit_user_options = _user_select_options(active_users)
+        current_user_id = int(selected_row["outsource_user_id"])
+        edit_labels = list(edit_user_options.keys())
+        edit_values = list(edit_user_options.values())
+        edit_index = edit_values.index(current_user_id) if current_user_id in edit_values else 0
+
+        with st.form("edit_cl_entry"):
+            edit_user = st.selectbox(
+                "Outsource user",
+                options=edit_labels,
+                index=edit_index,
+                key="edit_cl_user",
+            )
+            edit_date = st.date_input(
+                "CL date",
+                value=_date_input_default(selected_row.get("cl_date")),
+                format="DD-MM-YYYY",
+                key="edit_cl_date",
+            )
+            edit_remarks = st.text_area(
+                "Remarks",
+                value=str(selected_row.get("remarks") or ""),
+                key="edit_cl_remarks",
+            )
+            update_submitted = st.form_submit_button(
+                "Update CL",
+                type="primary",
+                use_container_width=True,
+            )
+            if update_submitted:
+                try:
+                    service.update_cl_entry(
+                        cl_id=int(selected_row["id"]),
+                        outsource_user_id=edit_user_options[edit_user],
+                        cl_date=edit_date,
+                        remarks=edit_remarks,
+                        actor_name=auth["name"],
+                    )
+                    st.success("CL updated.")
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+
+        if st.button("Delete Selected CL", use_container_width=True, key="delete_cl_entry_btn"):
+            try:
+                service.delete_cl_entry(int(selected_row["id"]), actor_name=auth["name"])
+                st.success("CL deleted.")
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
 
 
 def _render_admin_export(service: AttendanceService) -> None:
@@ -2435,6 +3140,8 @@ def render_attendance_admin_page() -> None:
         _render_admin_attendance(service)
     elif section == "Export":
         _render_admin_export(service)
+    elif section == "CL":
+        _render_admin_cl(service, auth)
     else:
         _render_admin_audit(service)
 

@@ -114,6 +114,58 @@ def test_monthly_attendance_percentage_uses_fixed_26_day_base(tmp_path):
     assert row["Attendance %"] == 100.0
 
 
+def test_cl_entry_counts_as_present_day(tmp_path):
+    service = AttendanceService(tmp_path / "attendance.sqlite")
+    outsource_id = service.add_user("CL User", "outsource", "9876543240")
+
+    service.add_cl_entry(outsource_id, "2026-05-05", remarks="Approved CL")
+
+    matrix = service.build_monthly_attendance_df("2026-05")
+    row = matrix[matrix["Name"] == "CL User"].iloc[0]
+
+    assert row["05 Tue"] == "CL"
+    assert row["Total Present Days"] == 1
+    assert row["Attendance %"] == 3.85
+
+
+def test_cl_does_not_double_count_accepted_login_day(tmp_path):
+    service = AttendanceService(tmp_path / "attendance.sqlite")
+    outsource_id = service.add_user("CL Double User", "outsource", "9876543241")
+
+    entry_id = service.submit_login(
+        outsource_id,
+        "pc-cl",
+        login_at=datetime(2026, 5, 6, 9, 30, tzinfo=IST),
+    )
+    service.decide_entry(entry_id, "accepted", "admin", "Admin")
+    service.add_cl_entry(outsource_id, "2026-05-06", remarks="Same day CL")
+
+    matrix = service.build_monthly_attendance_df("2026-05")
+    row = matrix[matrix["Name"] == "CL Double User"].iloc[0]
+
+    assert row["06 Wed"] == "G"
+    assert row["Total Present Days"] == 1
+
+
+def test_cl_entry_can_be_updated_and_deleted(tmp_path):
+    service = AttendanceService(tmp_path / "attendance.sqlite")
+    first_user = service.add_user("CL First User", "outsource", "9876543242")
+    second_user = service.add_user("CL Second User", "outsource", "9876543243")
+
+    cl_id = service.add_cl_entry(first_user, "2026-05-07")
+    service.update_cl_entry(cl_id, second_user, "2026-05-08", remarks="Changed")
+
+    cl_entries = service.list_cl_entries(month="2026-05")
+
+    assert cl_entries.iloc[0]["outsource_name"] == "CL Second User"
+    assert cl_entries.iloc[0]["cl_date"] == "2026-05-08"
+    assert cl_entries.iloc[0]["remarks"] == "Changed"
+
+    service.delete_cl_entry(cl_id)
+
+    assert service.list_cl_entries(month="2026-05").empty
+
+
 def test_user_joined_date_is_saved_and_exported(tmp_path):
     service = AttendanceService(tmp_path / "attendance.sqlite")
     user_id = service.add_user(
@@ -250,6 +302,7 @@ def test_export_workbook_contains_attendance_sheets(tmp_path):
         "Login Register",
         "Monthly Attendance",
         "Daily Summary",
+        "CL Register",
         "User Master",
         "Audit Log",
     ]
