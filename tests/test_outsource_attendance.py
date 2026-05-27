@@ -91,7 +91,11 @@ def test_monthly_attendance_counts_only_accepted_days(tmp_path):
 
     assert row["02 Sat"] == "G/N"
     assert row["03 Sun"] == ""
-    assert row["Total Present Days"] == 1
+    assert row["Total G"] == 1
+    assert row["Total N"] == 1
+    assert row["Present Days"] == 1
+    assert row["CL"] == 0
+    assert row["Total"] == 1
     assert row["Attendance %"] == 3.85
 
 
@@ -110,7 +114,9 @@ def test_monthly_attendance_percentage_uses_fixed_26_day_base(tmp_path):
     matrix = service.build_monthly_attendance_df("2026-05")
     row = matrix[matrix["Name"] == "Percentage User"].iloc[0]
 
-    assert row["Total Present Days"] == 26
+    assert row["Present Days"] == 26
+    assert row["CL"] == 0
+    assert row["Total"] == 26
     assert row["Attendance %"] == 100.0
 
 
@@ -124,7 +130,9 @@ def test_cl_entry_counts_as_present_day(tmp_path):
     row = matrix[matrix["Name"] == "CL User"].iloc[0]
 
     assert row["05 Tue"] == "CL"
-    assert row["Total Present Days"] == 1
+    assert row["Present Days"] == 0
+    assert row["CL"] == 1
+    assert row["Total"] == 1
     assert row["Attendance %"] == 3.85
 
 
@@ -144,7 +152,9 @@ def test_cl_does_not_double_count_accepted_login_day(tmp_path):
     row = matrix[matrix["Name"] == "CL Double User"].iloc[0]
 
     assert row["06 Wed"] == "G"
-    assert row["Total Present Days"] == 1
+    assert row["Present Days"] == 1
+    assert row["CL"] == 0
+    assert row["Total"] == 1
 
 
 def test_cl_entry_can_be_updated_and_deleted(tmp_path):
@@ -308,6 +318,41 @@ def test_export_workbook_contains_attendance_sheets(tmp_path):
     ]
     assert workbook["Monthly Attendance"]["A1"].value == "Monthly Attendance - Outsource Attendance"
     assert workbook["Monthly Attendance"]["A4"].value == "Neha Vendor"
+
+
+def test_yearly_export_contains_summary_and_month_dropdown(tmp_path):
+    service = AttendanceService(tmp_path / "attendance.sqlite")
+    outsource_id = service.add_user("Yearly User", "outsource", "9876543244")
+    entry_id = service.submit_login(
+        outsource_id,
+        "pc-year",
+        login_at=datetime(2026, 5, 4, 9, 30, tzinfo=IST),
+    )
+    service.decide_entry(entry_id, "accepted", "admin", "Admin")
+    service.add_cl_entry(outsource_id, "2026-05-05")
+
+    workbook_bytes = service.export_yearly_attendance_workbook(2026)
+    workbook = load_workbook(BytesIO(workbook_bytes), data_only=False)
+
+    assert [ws.title for ws in workbook.worksheets if ws.sheet_state == "visible"] == [
+        "Yearly Summary",
+        "Monthly Attendance",
+    ]
+    assert workbook["_Monthly Source"].sheet_state == "hidden"
+
+    summary_rows = list(workbook["Yearly Summary"].iter_rows(min_row=4, values_only=True))
+    may_row = next(row for row in summary_rows if row[0] == "May 2026" and row[1] == "Yearly User")
+
+    assert may_row[3] == 1
+    assert may_row[7] == 1
+    assert may_row[8] == 1
+    assert may_row[9] == 2
+    assert may_row[10] == 7.69
+
+    monthly = workbook["Monthly Attendance"]
+    assert monthly["B2"].value == "2026-01"
+    assert monthly["A4"].value.startswith("=FILTER(")
+    assert monthly.data_validations.count == 1
 
 
 def test_user_authentication_uses_password_and_keeps_hash_hidden(tmp_path):

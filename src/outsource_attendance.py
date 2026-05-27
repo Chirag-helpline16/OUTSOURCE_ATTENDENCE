@@ -15,8 +15,10 @@ from typing import Any
 
 import pandas as pd
 import streamlit as st
+from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.datavalidation import DataValidation
 
 try:
     from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
@@ -43,6 +45,13 @@ SHIFT_LABELS = {
     "E": "Evening",
     "N": "Night",
     "O": "Other",
+}
+SHIFT_TOTAL_COLUMNS = {
+    "M": "Total M",
+    "G": "Total G",
+    "E": "Total E",
+    "N": "Total N",
+    "O": "Total O",
 }
 
 
@@ -201,6 +210,11 @@ def _month_bounds(month: str) -> tuple[str, str]:
     else:
         end = date(parsed.year, parsed.month + 1, 1)
     return start.isoformat(), end.isoformat()
+
+
+def _year_months(year: int | str) -> list[str]:
+    clean_year = int(year)
+    return [f"{clean_year}-{month:02d}" for month in range(1, 13)]
 
 
 def _normalized_status_filter(status_filter: str | None) -> str:
@@ -1393,6 +1407,8 @@ class AttendanceService:
         for name in unique_names:
             row: dict[str, Any] = {"Name": name}
             present_days = 0
+            cl_days = 0
+            shift_counts = {code: 0 for code in SHIFT_TOTAL_COLUMNS}
 
             for day, column in enumerate(day_columns, start=1):
                 current_date = date(parsed.year, parsed.month, day).isoformat()
@@ -1405,22 +1421,36 @@ class AttendanceService:
                     )
                     marker = "/".join(shifts)
                     present_days += 1
+                    for shift_code in shifts:
+                        if shift_code in shift_counts:
+                            shift_counts[shift_code] += 1
                 elif key in cl_dates:
                     marker = "CL"
-                    present_days += 1
+                    cl_days += 1
                 elif key in pending_dates:
                     marker = "P"
                 row[column] = marker
-            row["Total Present Days"] = present_days
+            for shift_code, column_name in SHIFT_TOTAL_COLUMNS.items():
+                row[column_name] = shift_counts[shift_code]
+            row["Present Days"] = present_days
+            row["CL"] = cl_days
+            row["Total"] = present_days + cl_days
             row["Attendance %"] = round(
-                min(present_days, ATTENDANCE_PERCENT_BASE_DAYS)
+                min(row["Total"], ATTENDANCE_PERCENT_BASE_DAYS)
                 / ATTENDANCE_PERCENT_BASE_DAYS
                 * 100,
                 2,
             )
             rows.append(row)
 
-        return pd.DataFrame(rows, columns=["Name", *day_columns, "Total Present Days", "Attendance %"])
+        total_columns = [
+            *SHIFT_TOTAL_COLUMNS.values(),
+            "Present Days",
+            "CL",
+            "Total",
+            "Attendance %",
+        ]
+        return pd.DataFrame(rows, columns=["Name", *day_columns, *total_columns])
 
     def build_daily_summary_df(self, month: str) -> pd.DataFrame:
         parsed = datetime.strptime(month, "%Y-%m")
@@ -1473,6 +1503,153 @@ class AttendanceService:
             )
 
         return pd.DataFrame(rows)
+
+    def build_yearly_summary_df(self, year: int | str) -> pd.DataFrame:
+        rows: list[dict[str, Any]] = []
+        summary_columns = [
+            "Month",
+            "Name",
+            *SHIFT_TOTAL_COLUMNS.values(),
+            "Present Days",
+            "CL",
+            "Total",
+            "Attendance %",
+        ]
+
+        for month in _year_months(year):
+            matrix = self.build_monthly_attendance_df(month)
+            if matrix.empty:
+                continue
+            for _, row in matrix.iterrows():
+                rows.append(
+                    {
+                        "Month": _month_label(month),
+                        "Name": row.get("Name", ""),
+                        **{
+                            column: row.get(column, 0)
+                            for column in [
+                                *SHIFT_TOTAL_COLUMNS.values(),
+                                "Present Days",
+                                "CL",
+                                "Total",
+                                "Attendance %",
+                            ]
+                        },
+                    }
+                )
+
+        return pd.DataFrame(rows, columns=summary_columns)
+
+    def _build_yearly_monthly_source_df(self, year: int | str) -> pd.DataFrame:
+        day_columns = [f"{day:02d}" for day in range(1, 32)]
+        total_columns = [
+            *SHIFT_TOTAL_COLUMNS.values(),
+            "Present Days",
+            "CL",
+            "Total",
+            "Attendance %",
+        ]
+        source_columns = ["Month", "Name", *day_columns, *total_columns]
+        rows: list[dict[str, Any]] = []
+
+        for month in _year_months(year):
+            matrix = self.build_monthly_attendance_df(month)
+            if matrix.empty:
+                continue
+
+            month_day_columns = {
+                str(column)[:2]: str(column)
+                for column in matrix.columns
+                if len(str(column)) >= 2 and str(column)[:2].isdigit()
+            }
+            for _, row in matrix.iterrows():
+                record: dict[str, Any] = {
+                    "Month": month,
+                    "Name": row.get("Name", ""),
+                }
+                for day in day_columns:
+                    record[day] = row.get(month_day_columns.get(day, ""), "")
+                for column in total_columns:
+                    record[column] = row.get(column, 0)
+                rows.append(record)
+
+        return pd.DataFrame(rows, columns=source_columns)
+
+    @staticmethod
+    def _write_dataframe(
+        worksheet: Any,
+        dataframe: pd.DataFrame,
+        start_row: int = 1,
+        start_col: int = 1,
+    ) -> None:
+        for col_index, column_name in enumerate(dataframe.columns, start=start_col):
+            worksheet.cell(start_row, col_index, column_name)
+
+        for row_offset, (_, row) in enumerate(dataframe.iterrows(), start=1):
+            for col_offset, column_name in enumerate(dataframe.columns):
+                value = row.get(column_name, "")
+                if pd.isna(value):
+                    value = ""
+                worksheet.cell(start_row + row_offset, start_col + col_offset, value)
+
+    def export_yearly_attendance_workbook(self, year: int | str) -> bytes:
+        clean_year = int(year)
+        summary_df = self.build_yearly_summary_df(clean_year)
+        source_df = self._build_yearly_monthly_source_df(clean_year)
+
+        workbook = Workbook()
+        summary_ws = workbook.active
+        summary_ws.title = "Yearly Summary"
+        monthly_ws = workbook.create_sheet("Monthly Attendance")
+        source_ws = workbook.create_sheet("_Monthly Source")
+        source_ws.sheet_state = "hidden"
+
+        self._write_dataframe(summary_ws, summary_df, start_row=3)
+        self._write_dataframe(source_ws, source_df, start_row=1)
+
+        visible_columns = [column for column in source_df.columns if column != "Month"]
+        monthly_ws["A1"] = "Monthly Attendance - Outsource Attendance"
+        monthly_ws["A2"] = "Select Month"
+        monthly_ws["B2"] = f"{clean_year}-01"
+        month_values = ",".join(_year_months(clean_year))
+        month_validation = DataValidation(
+            type="list",
+            formula1=f'"{month_values}"',
+            allow_blank=False,
+        )
+        monthly_ws.add_data_validation(month_validation)
+        month_validation.add(monthly_ws["B2"])
+
+        monthly_ws["A3"] = "Name"
+        for day in range(1, 32):
+            cell = monthly_ws.cell(3, day + 1)
+            cell.value = (
+                f'=IF({day}<=DAY(EOMONTH(DATE(LEFT($B$2,4),RIGHT($B$2,2),1),0)),'
+                f'TEXT(DATE(LEFT($B$2,4),RIGHT($B$2,2),{day}),"dd ddd"),"")'
+            )
+        for offset, column_name in enumerate(visible_columns[32:], start=33):
+            monthly_ws.cell(3, offset, column_name)
+
+        source_last_row = max(len(source_df) + 1, 2)
+        source_last_col = get_column_letter(len(source_df.columns))
+        monthly_ws["A4"] = (
+            f"=FILTER('_Monthly Source'!$B$2:${source_last_col}${source_last_row},"
+            f"'_Monthly Source'!$A$2:$A${source_last_row}=$B$2,"
+            f'"No data")'
+        )
+
+        self._style_yearly_workbook(workbook, clean_year, len(visible_columns), len(source_df))
+
+        try:
+            workbook.calculation.fullCalcOnLoad = True
+            workbook.calculation.forceFullCalc = True
+        except AttributeError:
+            pass
+
+        output = BytesIO()
+        workbook.save(output)
+        output.seek(0)
+        return output.getvalue()
 
     def get_audit_log(self, limit: int = 500) -> pd.DataFrame:
         with self._connect() as conn:
@@ -1550,7 +1727,7 @@ class AttendanceService:
                 f"{now_ist().strftime('%d-%m-%Y %H:%M IST')}"
             )
             if worksheet.title == "Monthly Attendance":
-                subtitle += " | M 07-08, G 09-12, E 13-16, N 19-21, O other"
+                subtitle += " | M 07-08, G 09-12, E 13-16, N 19-21, O other, CL casual leave"
             worksheet["A2"] = subtitle
             worksheet["A1"].fill = title_fill
             worksheet["A1"].font = Font(color="FFFFFF", bold=True, size=15)
@@ -1585,13 +1762,124 @@ class AttendanceService:
                 width = min(max(max((len(value) for value in values), default=8) + 2, 10), 34)
                 if worksheet.title == "Monthly Attendance" and index > 1:
                     header = str(column_cells[2].value or "") if len(column_cells) >= 3 else ""
-                    width = 18 if header in {"Total Present Days", "Attendance %"} else 11
+                    width = (
+                        16
+                        if header
+                        in {
+                            *SHIFT_TOTAL_COLUMNS.values(),
+                            "Present Days",
+                            "Attendance %",
+                        }
+                        else 11
+                    )
                 worksheet.column_dimensions[get_column_letter(index)].width = width
 
             worksheet.freeze_panes = "A4"
             worksheet.sheet_view.showGridLines = False
             if worksheet.max_row >= 3:
                 worksheet.auto_filter.ref = f"A3:{get_column_letter(max_column)}{worksheet.max_row}"
+
+    def _style_yearly_workbook(
+        self,
+        workbook: Any,
+        year: int,
+        monthly_visible_columns: int,
+        source_row_count: int,
+    ) -> None:
+        title_fill = PatternFill("solid", fgColor="111827")
+        subtitle_fill = PatternFill("solid", fgColor="E8EEF7")
+        header_fill = PatternFill("solid", fgColor="C9DAF8")
+        selector_fill = PatternFill("solid", fgColor="FFF2CC")
+        border = Border(
+            left=Side(style="thin", color="CBD5E1"),
+            right=Side(style="thin", color="CBD5E1"),
+            top=Side(style="thin", color="CBD5E1"),
+            bottom=Side(style="thin", color="CBD5E1"),
+        )
+
+        summary_ws = workbook["Yearly Summary"]
+        summary_max_col = max(summary_ws.max_column, 1)
+        summary_ws.merge_cells(
+            start_row=1,
+            start_column=1,
+            end_row=1,
+            end_column=summary_max_col,
+        )
+        summary_ws.merge_cells(
+            start_row=2,
+            start_column=1,
+            end_row=2,
+            end_column=summary_max_col,
+        )
+        summary_ws["A1"] = "Yearly Summary - Outsource Attendance"
+        summary_ws["A2"] = (
+            f"Year: {year} | Generated: {now_ist().strftime('%d-%m-%Y %H:%M IST')}"
+        )
+        summary_ws["A1"].fill = title_fill
+        summary_ws["A1"].font = Font(color="FFFFFF", bold=True, size=15)
+        summary_ws["A1"].alignment = Alignment(horizontal="center")
+        summary_ws["A2"].fill = subtitle_fill
+        summary_ws["A2"].font = Font(color="334155", italic=True)
+        summary_ws["A2"].alignment = Alignment(horizontal="center")
+
+        for worksheet in [summary_ws, workbook["Monthly Attendance"]]:
+            max_column = max(worksheet.max_column, monthly_visible_columns)
+            for cell in worksheet[3]:
+                cell.fill = header_fill
+                cell.font = Font(bold=True, color="111827")
+                cell.border = border
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+            if worksheet.title == "Yearly Summary":
+                data_last_row = max(worksheet.max_row, 4)
+                worksheet.freeze_panes = "A4"
+                if worksheet.max_row >= 3 and worksheet.max_column >= 1:
+                    worksheet.auto_filter.ref = (
+                        f"A3:{get_column_letter(worksheet.max_column)}{worksheet.max_row}"
+                    )
+            else:
+                data_last_row = max(4 + max(source_row_count // 12, 1), 4)
+                worksheet.merge_cells(
+                    start_row=1,
+                    start_column=1,
+                    end_row=1,
+                    end_column=max_column,
+                )
+                worksheet["A1"].fill = title_fill
+                worksheet["A1"].font = Font(color="FFFFFF", bold=True, size=15)
+                worksheet["A1"].alignment = Alignment(horizontal="center")
+                worksheet["A2"].fill = selector_fill
+                worksheet["A2"].font = Font(bold=True, color="111827")
+                worksheet["B2"].fill = selector_fill
+                worksheet["B2"].font = Font(bold=True, color="111827")
+                worksheet["B2"].alignment = Alignment(horizontal="center")
+                worksheet.freeze_panes = "A4"
+
+            for row in worksheet.iter_rows(min_row=4, max_row=data_last_row, max_col=max_column):
+                for cell in row:
+                    cell.border = border
+                    cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+            for index in range(1, max_column + 1):
+                header = str(worksheet.cell(3, index).value or "")
+                if index == 1:
+                    width = 34
+                elif worksheet.title == "Monthly Attendance" and 2 <= index <= 32:
+                    width = 11
+                elif header in {
+                    *SHIFT_TOTAL_COLUMNS.values(),
+                    "Present Days",
+                    "Attendance %",
+                }:
+                    width = 16
+                else:
+                    width = 12
+                worksheet.column_dimensions[get_column_letter(index)].width = width
+
+            worksheet.sheet_view.showGridLines = False
+
+        source_ws = workbook["_Monthly Source"]
+        source_ws.sheet_view.showGridLines = False
 
 
 class MongoAttendanceService(AttendanceService):
@@ -2301,6 +2589,17 @@ def _month_options(service: AttendanceService) -> list[str]:
     return months
 
 
+def _year_options(service: AttendanceService) -> list[str]:
+    current = str(now_ist().year)
+    years = sorted(
+        {str(month)[:4] for month in service.get_available_months() if str(month)[:4].isdigit()},
+        reverse=True,
+    )
+    if current not in years:
+        years.insert(0, current)
+    return years
+
+
 def _status_title(value: Any) -> str:
     if pd.isna(value) or value in ("", None):
         return ""
@@ -2881,7 +3180,8 @@ def _render_admin_attendance(service: AttendanceService) -> None:
     matrix = service.build_monthly_attendance_df(month)
     st.caption(
         "Legend: M 07:00-08:59, G 09:00-12:59, E 13:00-16:59, "
-        f"N 19:00-21:59, O other, P pending, CL casual leave. Attendance % is calculated from "
+        f"N 19:00-21:59, O other, P pending, CL casual leave. Present Days exclude CL; "
+        f"Total = Present Days + CL. Attendance % uses Total over "
         f"{ATTENDANCE_PERCENT_BASE_DAYS} working days. Rejected entries are excluded."
     )
     if not matrix.empty:
@@ -3091,20 +3391,38 @@ def _render_admin_cl(service: AttendanceService, auth: dict[str, Any]) -> None:
 
 def _render_admin_export(service: AttendanceService) -> None:
     st.subheader("Excel Export")
-    month = st.selectbox(
-        "Export month",
-        options=_month_options(service),
-        format_func=_month_label,
-        key="admin_export_month",
-    )
-    excel_bytes = service.export_attendance_workbook(month)
-    st.download_button(
-        "Download Attendance Excel",
-        data=excel_bytes,
-        file_name=f"outsource_attendance_{month}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
+    monthly_tab, yearly_tab = st.tabs(["Monthly", "Yearly"])
+
+    with monthly_tab:
+        month = st.selectbox(
+            "Export month",
+            options=_month_options(service),
+            format_func=_month_label,
+            key="admin_export_month",
+        )
+        excel_bytes = service.export_attendance_workbook(month)
+        st.download_button(
+            "Download Monthly Attendance Excel",
+            data=excel_bytes,
+            file_name=f"outsource_attendance_{month}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+    with yearly_tab:
+        year = st.selectbox(
+            "Export year",
+            options=_year_options(service),
+            key="admin_export_year",
+        )
+        yearly_excel_bytes = service.export_yearly_attendance_workbook(int(year))
+        st.download_button(
+            "Download Yearly Attendance Excel",
+            data=yearly_excel_bytes,
+            file_name=f"outsource_attendance_{year}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
 
 
 def _render_admin_audit(service: AttendanceService) -> None:
