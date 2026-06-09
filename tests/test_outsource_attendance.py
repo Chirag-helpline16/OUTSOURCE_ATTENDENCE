@@ -1,11 +1,25 @@
 import sqlite3
+import sys
 from datetime import datetime, time
 from io import BytesIO
 
 import pytest
 from openpyxl import load_workbook
 
-from src.outsource_attendance import AttendanceService, IST, classify_shift
+from src.outsource_attendance import (
+    ADMIN_PASSWORD_ENV_VAR,
+    DB_ENV_VAR,
+    IST,
+    WINDOWS_APP_DATA_DIR,
+    AttendanceService,
+    MongoAttendanceService,
+    classify_shift,
+    get_default_db_path,
+    get_local_pc_name,
+    hash_password,
+    is_mongodb_required,
+    verify_password,
+)
 
 
 def test_classify_shift_boundaries():
@@ -19,6 +33,76 @@ def test_classify_shift_boundaries():
     assert classify_shift(time(19, 0))[0] == "N"
     assert classify_shift(time(21, 59))[0] == "N"
     assert classify_shift(time(22, 0))[0] == "O"
+
+
+def test_default_db_path_prefers_env_override(monkeypatch, tmp_path):
+    custom_path = tmp_path / "custom.sqlite"
+
+    monkeypatch.setenv(DB_ENV_VAR, str(custom_path))
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+
+    assert get_default_db_path() == custom_path
+
+
+def test_frozen_default_db_path_uses_local_app_data(monkeypatch, tmp_path):
+    monkeypatch.delenv(DB_ENV_VAR, raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+
+    assert get_default_db_path() == (
+        tmp_path / WINDOWS_APP_DATA_DIR / "data" / "outsource_attendance.sqlite"
+    )
+
+
+def test_local_pc_name_uses_windows_computername(monkeypatch):
+    monkeypatch.setenv("COMPUTERNAME", "cyber-pc-01")
+    monkeypatch.setenv("HOSTNAME", "other-host")
+
+    assert get_local_pc_name() == "CYBER-PC-01"
+
+
+def test_local_pc_name_falls_back_to_socket_hostname(monkeypatch):
+    monkeypatch.delenv("COMPUTERNAME", raising=False)
+    monkeypatch.delenv("HOSTNAME", raising=False)
+    monkeypatch.setattr("src.outsource_attendance.socket.gethostname", lambda: "fallback-pc")
+
+    assert get_local_pc_name() == "FALLBACK-PC"
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
+def test_mongodb_required_accepts_truthy_env_values(monkeypatch, value):
+    monkeypatch.setenv("DATALENS_REQUIRE_MONGODB", value)
+
+    assert is_mongodb_required()
+
+
+@pytest.mark.parametrize("value", ["", "0", "false", "no", "off"])
+def test_mongodb_required_rejects_falsey_env_values(monkeypatch, value):
+    monkeypatch.setenv("DATALENS_REQUIRE_MONGODB", value)
+
+    assert not is_mongodb_required()
+
+
+def test_admin_password_hash_uses_env_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv(ADMIN_PASSWORD_ENV_VAR, "local-admin-pass")
+
+    service = AttendanceService(tmp_path / "attendance.sqlite")
+
+    assert verify_password("local-admin-pass", service.get_admin_password_hash())
+    assert not verify_password("admin123", service.get_admin_password_hash())
+
+
+def test_mongo_admin_password_hash_prefers_shared_setting(monkeypatch):
+    class FakeSettings:
+        def find_one(self, query, projection):
+            return {"password_hash": hash_password("shared-admin-pass")}
+
+    monkeypatch.setenv(ADMIN_PASSWORD_ENV_VAR, "local-admin-pass")
+    service = MongoAttendanceService.__new__(MongoAttendanceService)
+    service.settings = FakeSettings()
+
+    assert verify_password("shared-admin-pass", service.get_admin_password_hash())
+    assert not verify_password("local-admin-pass", service.get_admin_password_hash())
 
 
 def test_observer_decision_and_admin_override(tmp_path):
@@ -209,6 +293,69 @@ def test_pending_filter_only_includes_entries_with_no_decision(tmp_path):
     pending = service.list_entries(month="2026-05", status_filter="pending")
 
     assert pending["id"].tolist() == [pending_entry]
+
+
+def test_bulk_accept_pending_rejects_same_day_duplicates(tmp_path):
+    service = AttendanceService(tmp_path / "attendance.sqlite")
+    first_user = service.add_user("Bulk First User", "outsource", "9876543240")
+    second_user = service.add_user("Bulk Second User", "outsource", "9876543241")
+
+    first_entry = service.submit_login(
+        first_user,
+        "pc-a",
+        login_at=datetime(2026, 5, 7, 8, 15, tzinfo=IST),
+    )
+    duplicate_entry = service.submit_login(
+        first_user,
+        "pc-b",
+        login_at=datetime(2026, 5, 7, 8, 45, tzinfo=IST),
+    )
+    other_entry = service.submit_login(
+        second_user,
+        "pc-c",
+        login_at=datetime(2026, 5, 7, 9, 30, tzinfo=IST),
+    )
+
+    result = service.accept_pending_reject_duplicates(
+        actor_role="observer",
+        actor_name="Observer Bulk",
+        month="2026-05",
+    )
+    entries = service.list_entries(month="2026-05").set_index("id")
+
+    assert result == {"pending": 3, "accepted": 2, "rejected": 1}
+    assert entries.loc[first_entry, "effective_status"] == "accepted"
+    assert entries.loc[duplicate_entry, "effective_status"] == "rejected"
+    assert entries.loc[duplicate_entry, "final_remarks"] == "Bulk rejected duplicate pending entry."
+    assert entries.loc[other_entry, "effective_status"] == "accepted"
+
+
+def test_bulk_rejects_pending_duplicate_when_day_already_accepted(tmp_path):
+    service = AttendanceService(tmp_path / "attendance.sqlite")
+    outsource_id = service.add_user("Bulk Accepted User", "outsource", "9876543242")
+
+    accepted_entry = service.submit_login(
+        outsource_id,
+        "pc-a",
+        login_at=datetime(2026, 5, 8, 8, 15, tzinfo=IST),
+    )
+    duplicate_entry = service.submit_login(
+        outsource_id,
+        "pc-b",
+        login_at=datetime(2026, 5, 8, 8, 45, tzinfo=IST),
+    )
+    service.decide_entry(accepted_entry, "accepted", "observer", "Observer One")
+
+    result = service.accept_pending_reject_duplicates(
+        actor_role="admin",
+        actor_name="Admin Bulk",
+        month="2026-05",
+    )
+    entries = service.list_entries(month="2026-05").set_index("id")
+
+    assert result == {"pending": 1, "accepted": 0, "rejected": 1}
+    assert entries.loc[accepted_entry, "effective_status"] == "accepted"
+    assert entries.loc[duplicate_entry, "effective_status"] == "rejected"
 
 
 def test_summary_metrics_count_effective_status_without_loading_entries(tmp_path):

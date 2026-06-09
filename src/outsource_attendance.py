@@ -6,7 +6,9 @@ import calendar
 import hashlib
 import hmac
 import os
+import socket
 import sqlite3
+import sys
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from io import BytesIO
@@ -33,8 +35,11 @@ DB_ENV_VAR = "DATALENS_OUTSOURCE_ATTENDANCE_DB"
 ADMIN_PASSWORD_ENV_VAR = "DATALENS_ATTENDANCE_ADMIN_PASSWORD"
 MONGODB_URI_ENV_VAR = "MONGODB_URI"
 MONGODB_DATABASE_ENV_VAR = "MONGODB_DATABASE"
+MONGODB_REQUIRED_ENV_VAR = "DATALENS_REQUIRE_MONGODB"
 DEFAULT_MONGODB_DATABASE = "attendance_db"
 DEFAULT_ADMIN_PASSWORD = "admin123"
+ADMIN_SETTINGS_ID = "admin_auth"
+WINDOWS_APP_DATA_DIR = "OutsourceAttendance"
 ATTENDANCE_PERCENT_BASE_DAYS = 26
 VALID_USER_ROLES = {"observer", "outsource"}
 VALID_DECISIONS = {"accepted", "rejected"}
@@ -85,6 +90,19 @@ def get_default_db_path(path: str | os.PathLike[str] | None = None) -> Path:
     if env_path:
         return Path(env_path)
 
+    if getattr(sys, "frozen", False):
+        app_data_root = (
+            os.environ.get("LOCALAPPDATA")
+            or os.environ.get("APPDATA")
+            or str(Path.home() / "AppData" / "Local")
+        )
+        return (
+            Path(app_data_root)
+            / WINDOWS_APP_DATA_DIR
+            / "data"
+            / "outsource_attendance.sqlite"
+        )
+
     return Path(__file__).resolve().parent.parent / "data" / "outsource_attendance.sqlite"
 
 
@@ -124,6 +142,19 @@ def _normalize_name(value: str) -> str:
 
 def _clean_pc_name(value: str) -> str:
     return " ".join(str(value or "").strip().upper().split())
+
+
+def get_local_pc_name() -> str:
+    """Return the machine name for locally packaged EXE runs."""
+    for value in (
+        os.environ.get("COMPUTERNAME"),
+        os.environ.get("HOSTNAME"),
+        socket.gethostname(),
+    ):
+        clean_name = _clean_pc_name(value or "")
+        if clean_name:
+            return clean_name
+    return ""
 
 
 def _clean_joined_date(value: Any) -> str:
@@ -270,6 +301,50 @@ def _mongo_status_filter(status_filter: str | None) -> dict[str, Any]:
     }
 
 
+def _entry_group_key(row: Any) -> tuple[int, str] | None:
+    user_id = getattr(row, "outsource_user_id", None)
+    login_date = getattr(row, "login_date", None)
+    if pd.isna(user_id) or pd.isna(login_date) or not str(login_date):
+        return None
+    return int(user_id), str(login_date)
+
+
+def _pending_bulk_decision_ids(
+    pending_entries: pd.DataFrame,
+    accepted_entries: pd.DataFrame,
+) -> tuple[list[int], list[int]]:
+    if pending_entries.empty:
+        return [], []
+
+    accepted_keys = {
+        key
+        for row in accepted_entries.itertuples(index=False)
+        if (key := _entry_group_key(row)) is not None
+    }
+    sorted_pending = pending_entries.sort_values(
+        by=["login_time_ist", "id"],
+        ascending=[True, True],
+        kind="stable",
+    )
+
+    pending_by_key: dict[tuple[int, str], list[int]] = {}
+    for row in sorted_pending.itertuples(index=False):
+        key = _entry_group_key(row)
+        if key is None:
+            continue
+        pending_by_key.setdefault(key, []).append(int(row.id))
+
+    accept_ids: list[int] = []
+    reject_ids: list[int] = []
+    for key, entry_ids in pending_by_key.items():
+        if key in accepted_keys:
+            reject_ids.extend(entry_ids)
+            continue
+        accept_ids.append(entry_ids[0])
+        reject_ids.extend(entry_ids[1:])
+    return accept_ids, reject_ids
+
+
 def _get_config_value(key: str, default: str = "") -> str:
     env_value = os.environ.get(key)
     if env_value:
@@ -279,6 +354,14 @@ def _get_config_value(key: str, default: str = "") -> str:
     except Exception:
         return default
     return str(value) if value is not None else default
+
+
+def _is_truthy(value: str) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def is_mongodb_required() -> bool:
+    return _is_truthy(_get_config_value(MONGODB_REQUIRED_ENV_VAR))
 
 
 def hash_password(password: str) -> str:
@@ -313,6 +396,9 @@ class AttendanceService:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA busy_timeout = 15000")
         return conn
+
+    def get_admin_password_hash(self) -> str:
+        return get_admin_password_hash()
 
     def initialize(self) -> None:
         """Create database tables if they do not exist."""
@@ -964,6 +1050,53 @@ class AttendanceService:
                 entry_id=entry_id,
                 details=remarks or None,
             )
+
+    def accept_pending_reject_duplicates(
+        self,
+        actor_role: str,
+        actor_name: str,
+        month: str | None = None,
+        outsource_user_id: int | None = None,
+    ) -> dict[str, int]:
+        actor_role = str(actor_role or "").strip().lower()
+        actor_name = _clean_name(actor_name) or actor_role.title()
+        if actor_role not in {"observer", "admin"}:
+            raise ValueError("Actor role must be observer or admin.")
+
+        pending_entries = self.list_entries(
+            month=month,
+            status_filter="pending",
+            outsource_user_id=outsource_user_id,
+        )
+        accepted_entries = self.list_entries(
+            month=month,
+            status_filter="accepted",
+            outsource_user_id=outsource_user_id,
+        )
+        accept_ids, reject_ids = _pending_bulk_decision_ids(pending_entries, accepted_entries)
+
+        for entry_id in accept_ids:
+            self.decide_entry(
+                entry_id=entry_id,
+                decision="accepted",
+                actor_role=actor_role,
+                actor_name=actor_name,
+                remarks="Bulk accepted pending entry.",
+            )
+        for entry_id in reject_ids:
+            self.decide_entry(
+                entry_id=entry_id,
+                decision="rejected",
+                actor_role=actor_role,
+                actor_name=actor_name,
+                remarks="Bulk rejected duplicate pending entry.",
+            )
+
+        return {
+            "pending": int(len(pending_entries)),
+            "accepted": len(accept_ids),
+            "rejected": len(reject_ids),
+        }
 
     def add_cl_entry(
         self,
@@ -1897,6 +2030,7 @@ class MongoAttendanceService(AttendanceService):
         self.cl_entries = self.db["attendance_cl_entries"]
         self.audit = self.db["attendance_audit_log"]
         self.counters = self.db["attendance_counters"]
+        self.settings = self.db["attendance_settings"]
         self.storage_label = f"MongoDB database: {self.database_name}"
         self.initialize()
 
@@ -1946,6 +2080,11 @@ class MongoAttendanceService(AttendanceService):
         )
         self.cl_entries.create_index([("cl_date", ASCENDING)], name="idx_att_cl_date")
         self.audit.create_index([("created_at", DESCENDING)], name="idx_att_audit_created_at")
+
+    def get_admin_password_hash(self) -> str:
+        row = self.settings.find_one({"_id": ADMIN_SETTINGS_ID}, {"password_hash": 1})
+        password_hash = row.get("password_hash") if row else None
+        return str(password_hash) if password_hash else super().get_admin_password_hash()
 
     def reset_all_data(self) -> None:
         self.audit.delete_many({})
@@ -2553,7 +2692,7 @@ class MongoAttendanceService(AttendanceService):
 
 @st.cache_resource(show_spinner=False)
 def get_attendance_service() -> AttendanceService:
-    """Return MongoDB storage when configured, otherwise local SQLite."""
+    """Return MongoDB storage when configured, otherwise local SQLite when allowed."""
     mongodb_uri = _get_config_value(MONGODB_URI_ENV_VAR)
     if mongodb_uri:
         database_name = _get_config_value(MONGODB_DATABASE_ENV_VAR, DEFAULT_MONGODB_DATABASE)
@@ -2578,6 +2717,23 @@ def get_attendance_service() -> AttendanceService:
             )
             st.caption(f"Technical detail: {exc.__class__.__name__}")
             st.stop()
+
+    if is_mongodb_required():
+        st.error("MongoDB Atlas is required for this app.")
+        st.warning(
+            "MONGODB_URI is not configured on this PC, so attendance data was not saved to SQLite."
+        )
+        st.caption("Set these values in PowerShell, close PowerShell, then reopen the EXE.")
+        st.code(
+            '[Environment]::SetEnvironmentVariable("MONGODB_URI", '
+            '"mongodb+srv://USER:PASSWORD@CLUSTER.mongodb.net/?appName=Cluster0", "User")\n'
+            '[Environment]::SetEnvironmentVariable("MONGODB_DATABASE", "attendance_db", "User")\n'
+            '[Environment]::SetEnvironmentVariable("DATALENS_ATTENDANCE_ADMIN_PASSWORD", '
+            '"YOUR_ADMIN_PASSWORD", "User")',
+            language="powershell",
+        )
+        st.stop()
+
     return AttendanceService()
 
 
@@ -2757,7 +2913,7 @@ def _render_auth_status(auth: dict[str, Any], role: str) -> None:
             _logout_authenticated_role(role)
 
 
-def _require_admin_auth() -> dict[str, Any] | None:
+def _require_admin_auth(service: AttendanceService) -> dict[str, Any] | None:
     session_key = _auth_key("admin")
     auth = st.session_state.get(session_key)
     if auth:
@@ -2771,7 +2927,7 @@ def _require_admin_auth() -> dict[str, Any] | None:
         password = st.text_input("Admin password", type="password")
         submitted = st.form_submit_button("Login", type="primary", use_container_width=True)
         if submitted:
-            if verify_password(password, get_admin_password_hash()):
+            if verify_password(password, service.get_admin_password_hash()):
                 st.session_state[session_key] = {
                     "role": "admin",
                     "name": _clean_name(admin_name) or "Admin",
@@ -2779,7 +2935,10 @@ def _require_admin_auth() -> dict[str, Any] | None:
                 st.rerun()
             else:
                 st.error("Incorrect admin password.")
-    st.caption(f"Admin password can be changed with environment variable {ADMIN_PASSWORD_ENV_VAR}.")
+    st.caption(
+        "Admin password uses MongoDB shared settings when configured, "
+        f"otherwise environment variable {ADMIN_PASSWORD_ENV_VAR}."
+    )
     return None
 
 
@@ -2895,6 +3054,49 @@ def _render_decision_form(
             save_decision("rejected")
 
 
+def _render_bulk_pending_action(
+    service: AttendanceService,
+    pending_entries: pd.DataFrame,
+    actor_role: str,
+    actor_name: str,
+    month: str,
+    key_prefix: str,
+    outsource_user_id: int | None = None,
+) -> None:
+    if pending_entries.empty:
+        return
+
+    accepted_entries = service.list_entries(
+        month=month,
+        status_filter="accepted",
+        outsource_user_id=outsource_user_id,
+    )
+    accept_ids, reject_ids = _pending_bulk_decision_ids(pending_entries, accepted_entries)
+    st.caption(
+        f"Bulk pending: {len(accept_ids)} accept, {len(reject_ids)} duplicate reject."
+    )
+    if st.button(
+        "Accept Pending, Reject Duplicates",
+        type="primary",
+        use_container_width=True,
+        key=f"{key_prefix}_bulk_accept_pending",
+    ):
+        try:
+            result = service.accept_pending_reject_duplicates(
+                actor_role=actor_role,
+                actor_name=actor_name,
+                month=month,
+                outsource_user_id=outsource_user_id,
+            )
+            st.success(
+                f"Accepted {result['accepted']} pending entries and "
+                f"rejected {result['rejected']} duplicates."
+            )
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
+
 ADMIN_SECTIONS = ["Approvals", "Users", "Attendance", "Export", "CL", "Audit"]
 OBSERVER_VIEWS = ["Pending", "All Entries"]
 
@@ -2930,6 +3132,11 @@ def _render_admin_approvals(service: AttendanceService, auth: dict[str, Any]) ->
         status_filter=status,
         outsource_user_id=outsource_options[outsource_name],
     )
+    pending_entries = entries if status == "pending" else service.list_entries(
+        month=month,
+        status_filter="pending",
+        outsource_user_id=outsource_options[outsource_name],
+    )
     if not entries.empty:
         ip_values = entries["ip_address"] if "ip_address" in entries.columns else pd.Series([""] * len(entries))
         ip_captured = ip_values.fillna("").astype(str).str.strip().astype(bool).sum()
@@ -2937,6 +3144,15 @@ def _render_admin_approvals(service: AttendanceService, auth: dict[str, Any]) ->
             f"IP captured for {ip_captured} of {len(entries)} visible entries. "
             "Old entries may show Not captured."
         )
+    _render_bulk_pending_action(
+        service=service,
+        pending_entries=pending_entries,
+        actor_role="admin",
+        actor_name=auth["name"],
+        month=month,
+        outsource_user_id=outsource_options[outsource_name],
+        key_prefix="admin_decision",
+    )
     st.dataframe(
         _display_entries(entries, include_ip=True)
         if not entries.empty
@@ -3432,7 +3648,7 @@ def _render_admin_audit(service: AttendanceService) -> None:
 
 def render_attendance_admin_page() -> None:
     service = get_attendance_service()
-    auth = _require_admin_auth()
+    auth = _require_admin_auth(service)
     if not auth:
         return
 
@@ -3491,6 +3707,14 @@ def render_attendance_observer_page() -> None:
 
     if view == "Pending":
         pending_entries = service.list_entries(month=month, status_filter="pending")
+        _render_bulk_pending_action(
+            service=service,
+            pending_entries=pending_entries,
+            actor_role="observer",
+            actor_name=auth["name"],
+            month=month,
+            key_prefix="observer_pending",
+        )
         st.dataframe(
             _display_entries(pending_entries) if not pending_entries.empty else _empty_entries_display(),
             use_container_width=True,
@@ -3537,9 +3761,11 @@ def render_outsource_login_page() -> None:
     st.metric("Current IST Shift", f"{shift_code} - {shift_name}")
     st.caption(current_time.strftime("%d-%m-%Y %H:%M:%S IST"))
 
+    pc_name = get_local_pc_name()
+
     with st.form("outsource_login_form"):
         st.text_input("Name", value=auth["name"], disabled=True)
-        pc_name = st.text_input("PC Name", placeholder="Example: CYBER-PC-01")
+        st.text_input("PC Name", value=pc_name, disabled=True)
         submitted = st.form_submit_button("Submit Login", type="primary", use_container_width=True)
         if submitted:
             try:
