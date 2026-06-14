@@ -3761,11 +3761,15 @@ def render_outsource_login_page() -> None:
     st.metric("Current IST Shift", f"{shift_code} - {shift_name}")
     st.caption(current_time.strftime("%d-%m-%Y %H:%M:%S IST"))
 
-    pc_name = get_local_pc_name()
+    detected_pc_name = get_local_pc_name()
 
     with st.form("outsource_login_form"):
         st.text_input("Name", value=auth["name"], disabled=True)
-        st.text_input("PC Name", value=pc_name, disabled=True)
+        pc_name = st.text_input(
+            "PC Name",
+            value=detected_pc_name,
+            help="Auto-detected from this computer. Edit it if you need to enter the PC name manually.",
+        )
         submitted = st.form_submit_button("Submit Login", type="primary", use_container_width=True)
         if submitted:
             try:
