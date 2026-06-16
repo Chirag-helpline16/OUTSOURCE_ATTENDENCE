@@ -43,6 +43,10 @@ WINDOWS_APP_DATA_DIR = "OutsourceAttendance"
 ATTENDANCE_PERCENT_BASE_DAYS = 26
 VALID_USER_ROLES = {"observer", "outsource"}
 VALID_DECISIONS = {"accepted", "rejected"}
+ALREADY_LOGGED_IN_TODAY_MESSAGE = (
+    "You have already submitted your login for today. "
+    "Only one login is allowed per day."
+)
 SHIFT_ORDER = {"M": 1, "G": 2, "E": 3, "N": 4, "O": 5}
 SHIFT_LABELS = {
     "M": "Morning",
@@ -956,6 +960,17 @@ class AttendanceService:
             ).fetchone()
             if user is None:
                 raise ValueError("Select an active outsource user.")
+
+            existing = conn.execute(
+                """
+                SELECT 1 FROM login_entries
+                WHERE outsource_user_id = ? AND login_date = ?
+                LIMIT 1
+                """,
+                (int(user["id"]), login_time.date().isoformat()),
+            ).fetchone()
+            if existing is not None:
+                raise ValueError(ALREADY_LOGGED_IN_TODAY_MESSAGE)
 
             cursor = conn.execute(
                 """
@@ -2352,6 +2367,15 @@ class MongoAttendanceService(AttendanceService):
             raise ValueError("Select an active outsource user.")
 
         login_time = _coerce_ist(login_at)
+        existing = self.entries.find_one(
+            {
+                "outsource_user_id": int(user["id"]),
+                "login_date": login_time.date().isoformat(),
+            }
+        )
+        if existing is not None:
+            raise ValueError(ALREADY_LOGGED_IN_TODAY_MESSAGE)
+
         shift_code, shift_name = classify_shift(login_time)
         entry_id = self._next_id("login_entries")
         clean_ip = _clean_ip_address(ip_address)

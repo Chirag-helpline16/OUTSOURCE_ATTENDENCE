@@ -8,6 +8,7 @@ from openpyxl import load_workbook
 
 from src.outsource_attendance import (
     ADMIN_PASSWORD_ENV_VAR,
+    ALREADY_LOGGED_IN_TODAY_MESSAGE,
     DB_ENV_VAR,
     IST,
     WINDOWS_APP_DATA_DIR,
@@ -20,6 +21,37 @@ from src.outsource_attendance import (
     is_mongodb_required,
     verify_password,
 )
+
+
+def _insert_legacy_login(service, outsource_user_id, name, login_at, pc_name="pc-legacy"):
+    """Insert a raw login row directly, bypassing the one-login-per-day guard.
+
+    Used to simulate duplicate same-day entries that already existed in the
+    database before the one-login-per-day rule was introduced.
+    """
+    shift_code, shift_name = classify_shift(login_at)
+    created_at = login_at.isoformat(timespec="seconds")
+    with service._connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO login_entries (
+                outsource_user_id, outsource_name, pc_name, ip_address,
+                login_time_ist, login_date, shift_code, shift_name, created_at
+            )
+            VALUES (?, ?, ?, '', ?, ?, ?, ?, ?)
+            """,
+            (
+                int(outsource_user_id),
+                name,
+                pc_name.upper(),
+                created_at,
+                login_at.date().isoformat(),
+                shift_code,
+                shift_name,
+                created_at,
+            ),
+        )
+        return int(cursor.lastrowid)
 
 
 def test_classify_shift_boundaries():
@@ -158,12 +190,12 @@ def test_monthly_attendance_counts_only_accepted_days(tmp_path):
     second = service.submit_login(
         outsource_id,
         "pc-b",
-        login_at=datetime(2026, 5, 2, 19, 30, tzinfo=IST),
+        login_at=datetime(2026, 5, 3, 19, 30, tzinfo=IST),
     )
     third = service.submit_login(
         outsource_id,
         "pc-c",
-        login_at=datetime(2026, 5, 3, 13, 30, tzinfo=IST),
+        login_at=datetime(2026, 5, 4, 13, 30, tzinfo=IST),
     )
 
     service.decide_entry(first, "accepted", "admin", "Admin")
@@ -173,14 +205,44 @@ def test_monthly_attendance_counts_only_accepted_days(tmp_path):
     matrix = service.build_monthly_attendance_df("2026-05")
     row = matrix[matrix["Name"] == "Ravi Outsource"].iloc[0]
 
-    assert row["02 Sat"] == "G/N"
-    assert row["03 Sun"] == ""
+    assert row["02 Sat"] == "G"
+    assert row["03 Sun"] == "N"
+    assert row["04 Mon"] == ""
     assert row["Total G"] == 1
     assert row["Total N"] == 1
-    assert row["Present Days"] == 1
+    assert row["Present Days"] == 2
     assert row["CL"] == 0
-    assert row["Total"] == 1
-    assert row["Attendance %"] == 3.85
+    assert row["Total"] == 2
+    assert row["Attendance %"] == 7.69
+
+
+def test_submit_login_allows_only_one_login_per_day(tmp_path):
+    service = AttendanceService(tmp_path / "attendance.sqlite")
+    outsource_id = service.add_user("Once Daily User", "outsource", "9876543250")
+
+    first = service.submit_login(
+        outsource_id,
+        "pc-a",
+        login_at=datetime(2026, 5, 12, 8, 30, tzinfo=IST),
+    )
+
+    with pytest.raises(ValueError, match="already submitted your login for today"):
+        service.submit_login(
+            outsource_id,
+            "pc-b",
+            login_at=datetime(2026, 5, 12, 19, 30, tzinfo=IST),
+        )
+
+    # A login on a different day is still allowed.
+    second_day = service.submit_login(
+        outsource_id,
+        "pc-c",
+        login_at=datetime(2026, 5, 13, 9, 30, tzinfo=IST),
+    )
+
+    entries = service.list_entries(outsource_user_id=outsource_id)
+    assert entries["id"].tolist() == [second_day, first]
+    assert "only one login is allowed per day" in ALREADY_LOGGED_IN_TODAY_MESSAGE.lower()
 
 
 def test_monthly_attendance_percentage_uses_fixed_26_day_base(tmp_path):
@@ -305,10 +367,11 @@ def test_bulk_accept_pending_rejects_same_day_duplicates(tmp_path):
         "pc-a",
         login_at=datetime(2026, 5, 7, 8, 15, tzinfo=IST),
     )
-    duplicate_entry = service.submit_login(
+    duplicate_entry = _insert_legacy_login(
+        service,
         first_user,
-        "pc-b",
-        login_at=datetime(2026, 5, 7, 8, 45, tzinfo=IST),
+        "Bulk First User",
+        datetime(2026, 5, 7, 8, 45, tzinfo=IST),
     )
     other_entry = service.submit_login(
         second_user,
@@ -339,10 +402,11 @@ def test_bulk_rejects_pending_duplicate_when_day_already_accepted(tmp_path):
         "pc-a",
         login_at=datetime(2026, 5, 8, 8, 15, tzinfo=IST),
     )
-    duplicate_entry = service.submit_login(
+    duplicate_entry = _insert_legacy_login(
+        service,
         outsource_id,
-        "pc-b",
-        login_at=datetime(2026, 5, 8, 8, 45, tzinfo=IST),
+        "Bulk Accepted User",
+        datetime(2026, 5, 8, 8, 45, tzinfo=IST),
     )
     service.decide_entry(accepted_entry, "accepted", "observer", "Observer One")
 
