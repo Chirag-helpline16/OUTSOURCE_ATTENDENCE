@@ -2982,7 +2982,12 @@ def _require_user_auth(service: AttendanceService, role: str) -> dict[str, Any] 
 
     user_options = {str(row["name"]): int(row["id"]) for _, row in users.iterrows()}
     with st.form(f"attendance_{role}_login_form"):
-        selected_label = st.selectbox("User", options=list(user_options.keys()))
+        selected_label = st.selectbox(
+            "User",
+            options=list(user_options.keys()),
+            index=None,
+            placeholder="Select your name",
+        )
         if role == "outsource":
             credential = st.text_input("Mobile number")
             help_text = "Enter your mobile number saved by admin."
@@ -2992,6 +2997,9 @@ def _require_user_auth(service: AttendanceService, role: str) -> dict[str, Any] 
         st.caption(help_text)
         submitted = st.form_submit_button("Login", type="primary", use_container_width=True)
         if submitted:
+            if not selected_label:
+                st.error("Please select your name first.")
+                return None
             if role == "outsource":
                 user = service.authenticate_outsource_user(
                     user_id=user_options[selected_label],
