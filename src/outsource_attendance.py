@@ -62,6 +62,15 @@ SHIFT_TOTAL_COLUMNS = {
     "N": "Total N",
     "O": "Total O",
 }
+# Representative login time per shift, chosen so classify_shift() maps it back to
+# the same code. Used when an admin adds attendance manually without a real time.
+SHIFT_REPRESENTATIVE_TIME = {
+    "M": time(8, 0),
+    "G": time(10, 0),
+    "E": time(14, 0),
+    "N": time(20, 0),
+    "O": time(17, 0),
+}
 
 
 def now_ist() -> datetime:
@@ -1003,6 +1012,129 @@ class AttendanceService:
                 details=f"{user['name']} submitted login from {clean_pc} as {shift_code} IP {clean_ip or 'unknown'}",
             )
             return entry_id
+
+    def add_manual_login(
+        self,
+        outsource_user_id: int,
+        login_date: Any,
+        shift_code: str = "G",
+        remarks: str = "",
+        actor_name: str = "Admin",
+    ) -> int:
+        """Admin-add an accepted attendance entry for a user on a given date."""
+        clean_date = _clean_required_iso_date(login_date, "Login date")
+        shift_code = str(shift_code or "").strip().upper()
+        if shift_code not in SHIFT_LABELS:
+            raise ValueError("Select a valid shift.")
+        shift_name = SHIFT_LABELS[shift_code]
+        actor_name = _clean_name(actor_name) or "Admin"
+        clean_remarks = str(remarks or "").strip()
+        login_time = datetime.combine(
+            date.fromisoformat(clean_date),
+            SHIFT_REPRESENTATIVE_TIME[shift_code],
+            tzinfo=IST,
+        )
+        timestamp = _timestamp()
+
+        with self._connect() as conn:
+            user = conn.execute(
+                """
+                SELECT id, name FROM users
+                WHERE id = ? AND role = 'outsource' AND active = 1
+                """,
+                (outsource_user_id,),
+            ).fetchone()
+            if user is None:
+                raise ValueError("Select an active outsource user.")
+
+            existing = conn.execute(
+                """
+                SELECT 1 FROM login_entries
+                WHERE outsource_user_id = ? AND login_date = ?
+                LIMIT 1
+                """,
+                (int(user["id"]), clean_date),
+            ).fetchone()
+            if existing is not None:
+                raise ValueError("An attendance entry already exists for this user on this date.")
+
+            cursor = conn.execute(
+                """
+                INSERT INTO login_entries (
+                    outsource_user_id, outsource_name, pc_name, ip_address, login_time_ist,
+                    login_date, shift_code, shift_name, created_at,
+                    admin_status, admin_by, admin_decided_at, admin_remarks
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?, ?)
+                """,
+                (
+                    int(user["id"]),
+                    user["name"],
+                    "ADMIN ENTRY",
+                    "",
+                    login_time.isoformat(timespec="seconds"),
+                    clean_date,
+                    shift_code,
+                    shift_name,
+                    timestamp,
+                    actor_name,
+                    timestamp,
+                    clean_remarks or "Added manually by admin.",
+                ),
+            )
+            entry_id = int(cursor.lastrowid)
+            self._log_event(
+                conn,
+                "admin_manual_login",
+                actor_role="admin",
+                actor_name=actor_name,
+                entry_id=entry_id,
+                user_id=int(user["id"]),
+                details=f"Attendance added for {user['name']} on {clean_date} as {shift_code}",
+            )
+            return entry_id
+
+    def update_entry_shift(
+        self,
+        entry_id: int,
+        shift_code: str,
+        actor_name: str = "Admin",
+    ) -> None:
+        """Admin override of the shift recorded on an existing login entry."""
+        shift_code = str(shift_code or "").strip().upper()
+        if shift_code not in SHIFT_LABELS:
+            raise ValueError("Select a valid shift.")
+        shift_name = SHIFT_LABELS[shift_code]
+        actor_name = _clean_name(actor_name) or "Admin"
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, outsource_user_id, outsource_name, shift_code
+                FROM login_entries
+                WHERE id = ?
+                """,
+                (entry_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("Entry not found.")
+
+            conn.execute(
+                "UPDATE login_entries SET shift_code = ?, shift_name = ? WHERE id = ?",
+                (shift_code, shift_name, entry_id),
+            )
+            self._log_event(
+                conn,
+                "admin_shift_changed",
+                actor_role="admin",
+                actor_name=actor_name,
+                entry_id=int(entry_id),
+                user_id=int(row["outsource_user_id"]),
+                details=(
+                    f"Shift for {row['outsource_name']} changed "
+                    f"from {row['shift_code']} to {shift_code}"
+                ),
+            )
 
     def decide_entry(
         self,
@@ -2412,6 +2544,107 @@ class MongoAttendanceService(AttendanceService):
         )
         return entry_id
 
+    def add_manual_login(
+        self,
+        outsource_user_id: int,
+        login_date: Any,
+        shift_code: str = "G",
+        remarks: str = "",
+        actor_name: str = "Admin",
+    ) -> int:
+        clean_date = _clean_required_iso_date(login_date, "Login date")
+        shift_code = str(shift_code or "").strip().upper()
+        if shift_code not in SHIFT_LABELS:
+            raise ValueError("Select a valid shift.")
+        shift_name = SHIFT_LABELS[shift_code]
+        actor_name = _clean_name(actor_name) or "Admin"
+        clean_remarks = str(remarks or "").strip()
+        login_time = datetime.combine(
+            date.fromisoformat(clean_date),
+            SHIFT_REPRESENTATIVE_TIME[shift_code],
+            tzinfo=IST,
+        )
+
+        user = self.users.find_one(
+            {"id": int(outsource_user_id), "role": "outsource", "active": True}
+        )
+        if user is None:
+            raise ValueError("Select an active outsource user.")
+
+        existing = self.entries.find_one(
+            {"outsource_user_id": int(user["id"]), "login_date": clean_date}
+        )
+        if existing is not None:
+            raise ValueError("An attendance entry already exists for this user on this date.")
+
+        timestamp = _timestamp()
+        entry_id = self._next_id("login_entries")
+        self.entries.insert_one(
+            {
+                "id": entry_id,
+                "outsource_user_id": int(user["id"]),
+                "outsource_name": user["name"],
+                "pc_name": "ADMIN ENTRY",
+                "ip_address": "",
+                "login_time_ist": login_time.isoformat(timespec="seconds"),
+                "login_date": clean_date,
+                "shift_code": shift_code,
+                "shift_name": shift_name,
+                "created_at": timestamp,
+                "observer_status": None,
+                "observer_by": None,
+                "observer_decided_at": None,
+                "observer_remarks": None,
+                "admin_status": "accepted",
+                "admin_by": actor_name,
+                "admin_decided_at": timestamp,
+                "admin_remarks": clean_remarks or "Added manually by admin.",
+            }
+        )
+        self._log_event(
+            None,
+            "admin_manual_login",
+            actor_role="admin",
+            actor_name=actor_name,
+            entry_id=entry_id,
+            user_id=int(user["id"]),
+            details=f"Attendance added for {user['name']} on {clean_date} as {shift_code}",
+        )
+        return entry_id
+
+    def update_entry_shift(
+        self,
+        entry_id: int,
+        shift_code: str,
+        actor_name: str = "Admin",
+    ) -> None:
+        shift_code = str(shift_code or "").strip().upper()
+        if shift_code not in SHIFT_LABELS:
+            raise ValueError("Select a valid shift.")
+        shift_name = SHIFT_LABELS[shift_code]
+        actor_name = _clean_name(actor_name) or "Admin"
+
+        row = self.entries.find_one({"id": int(entry_id)})
+        if row is None:
+            raise ValueError("Entry not found.")
+
+        self.entries.update_one(
+            {"id": int(entry_id)},
+            {"$set": {"shift_code": shift_code, "shift_name": shift_name}},
+        )
+        self._log_event(
+            None,
+            "admin_shift_changed",
+            actor_role="admin",
+            actor_name=actor_name,
+            entry_id=int(entry_id),
+            user_id=int(row["outsource_user_id"]),
+            details=(
+                f"Shift for {row.get('outsource_name')} changed "
+                f"from {row.get('shift_code')} to {shift_code}"
+            ),
+        )
+
     def decide_entry(
         self,
         entry_id: int,
@@ -3417,7 +3650,130 @@ def _render_admin_users(service: AttendanceService, auth: dict[str, Any]) -> Non
                         st.error(str(exc))
 
 
-def _render_admin_attendance(service: AttendanceService) -> None:
+def _render_admin_add_attendance(service: AttendanceService, auth: dict[str, Any]) -> None:
+    st.subheader("Add Attendance")
+    st.caption(
+        "Manually record an accepted login for a person on a specific date. "
+        "One entry is allowed per person per day."
+    )
+
+    active_users = service.list_users(role="outsource", active=True)
+    if active_users.empty:
+        st.warning("Create an active outsource user before adding attendance.")
+        return
+
+    user_options = _user_select_options(active_users)
+    shift_options = {f"{code} - {label}": code for code, label in SHIFT_LABELS.items()}
+    with st.form("admin_add_attendance"):
+        selected_user = st.selectbox(
+            "Outsource user",
+            options=list(user_options.keys()),
+            key="admin_add_att_user",
+        )
+        col_date, col_shift = st.columns(2)
+        with col_date:
+            login_date = st.date_input(
+                "Attendance date",
+                value=now_ist().date(),
+                format="DD-MM-YYYY",
+                key="admin_add_att_date",
+            )
+        with col_shift:
+            selected_shift = st.selectbox(
+                "Shift",
+                options=list(shift_options.keys()),
+                index=1,
+                key="admin_add_att_shift",
+            )
+        remarks = st.text_area(
+            "Remarks",
+            placeholder="Optional reason or note.",
+            key="admin_add_att_remarks",
+        )
+        submitted = st.form_submit_button(
+            "Add Attendance",
+            type="primary",
+            use_container_width=True,
+        )
+        if submitted:
+            try:
+                entry_id = service.add_manual_login(
+                    outsource_user_id=user_options[selected_user],
+                    login_date=login_date,
+                    shift_code=shift_options[selected_shift],
+                    remarks=remarks,
+                    actor_name=auth["name"],
+                )
+                st.success(f"Attendance added. Entry ID: {entry_id}")
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+
+
+def _render_admin_change_shift(service: AttendanceService, auth: dict[str, Any]) -> None:
+    st.subheader("Change Shift")
+    st.caption("Override the shift recorded on an existing login entry.")
+
+    month = st.selectbox(
+        "Month",
+        options=_month_options(service),
+        format_func=_month_label,
+        key="admin_shift_month",
+    )
+    entries = service.list_entries(month=month)
+    if entries.empty:
+        st.info("No login entries for this month.")
+        return
+
+    entry_options = {
+        f"#{int(row['id'])} | {row['outsource_name']} | {row['login_date']} | "
+        f"{row['shift_code']} - {row['shift_name']}": int(row["id"])
+        for _, row in entries.iterrows()
+    }
+    selected_entry = st.selectbox(
+        "Login entry",
+        options=list(entry_options.keys()),
+        key="admin_shift_entry",
+    )
+    selected_row = entries[entries["id"] == entry_options[selected_entry]].iloc[0]
+
+    shift_options = {f"{code} - {label}": code for code, label in SHIFT_LABELS.items()}
+    shift_labels = list(shift_options.keys())
+    current_code = str(selected_row.get("shift_code") or "")
+    current_index = next(
+        (i for i, label in enumerate(shift_labels) if shift_options[label] == current_code),
+        0,
+    )
+    with st.form("admin_change_shift"):
+        selected_shift = st.selectbox(
+            "New shift",
+            options=shift_labels,
+            index=current_index,
+            key="admin_change_shift_value",
+        )
+        submitted = st.form_submit_button(
+            "Update Shift",
+            type="primary",
+            use_container_width=True,
+        )
+        if submitted:
+            try:
+                service.update_entry_shift(
+                    entry_id=int(selected_row["id"]),
+                    shift_code=shift_options[selected_shift],
+                    actor_name=auth["name"],
+                )
+                st.success("Shift updated.")
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+
+
+def _render_admin_attendance(service: AttendanceService, auth: dict[str, Any]) -> None:
+    _render_admin_add_attendance(service, auth)
+    st.markdown("---")
+    _render_admin_change_shift(service, auth)
+    st.markdown("---")
     st.subheader("Attendance Register")
     month = st.selectbox(
         "Attendance month",
@@ -3703,7 +4059,7 @@ def render_attendance_admin_page() -> None:
     elif section == "Users":
         _render_admin_users(service, auth)
     elif section == "Attendance":
-        _render_admin_attendance(service)
+        _render_admin_attendance(service, auth)
     elif section == "Export":
         _render_admin_export(service)
     elif section == "CL":
